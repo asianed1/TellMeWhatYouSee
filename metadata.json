@@ -1,0 +1,6 @@
+{
+  "name": "TellMeWhatYouSee",
+  "description": "AI-powered vision assistant providing spoken scene descriptions, hazard alerts, and haptic warnings for visually impaired users.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
