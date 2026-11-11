@@ -31,6 +31,11 @@ class OnDeviceSafetyEngine {
         ObjectDetection.getClient(options)
     }
 
+    // Approach tracking state (compares consecutive on-demand or auto scans)
+    private var lastObjectAreaMetric: Float = 0f
+    private var lastObjectName: String = ""
+    private var lastScanTimeMs: Long = 0L
+
     /**
      * Evaluates a camera frame bitmap on-device.
      */
@@ -44,6 +49,9 @@ class OnDeviceSafetyEngine {
         // 2. Check for Floor Discontinuity / Drop-Off Void in ground sector
         val hasDropOffVoid = detectGroundDiscontinuity(bitmap)
 
+        // 3. Check for Pothole or localized ground cavity
+        val hasPothole = detectPotholeOrGroundCavity(bitmap)
+
         if (hasDropOffVoid) {
             return HazardAssessment(
                 severity = HazardSeverity.IMMINENT_DANGER,
@@ -54,14 +62,35 @@ class OnDeviceSafetyEngine {
             )
         }
 
-        if (hasStairsPattern) {
+        if (hasPothole) {
             return HazardAssessment(
                 severity = HazardSeverity.IMMINENT_DANGER,
-                spokenAlert = "STOP! Stairs detected directly ahead.",
-                detailedSummary = "Parallel step lines detected in path. Please verify with cane or handrail.",
-                hasStairsDown = true,
+                spokenAlert = "STOP! Pothole or hole in path directly ahead.",
+                detailedSummary = "Localized ground depression or pothole void detected.",
+                hasPotholeOrVoid = true,
                 isOfflineEngine = true
             )
+        }
+
+        if (hasStairsPattern) {
+            val isDescending = isStairsDescending(bitmap)
+            return if (isDescending) {
+                HazardAssessment(
+                    severity = HazardSeverity.IMMINENT_DANGER,
+                    spokenAlert = "STOP! Stairs going down directly ahead.",
+                    detailedSummary = "Descending staircase detected in path. High fall hazard.",
+                    hasStairsDown = true,
+                    isOfflineEngine = true
+                )
+            } else {
+                HazardAssessment(
+                    severity = HazardSeverity.CAUTION,
+                    spokenAlert = "Caution: Steps going up directly ahead.",
+                    detailedSummary = "Ascending staircase detected. Navigable steps ahead.",
+                    hasStairsUp = true,
+                    isOfflineEngine = true
+                )
+            }
         }
 
         // 3. Local ML Kit Object Detection in central walking corridor
@@ -75,17 +104,50 @@ class OnDeviceSafetyEngine {
                 HazardSeverity.CAUTION
             }
 
-            val alertText = if (severity == HazardSeverity.IMMINENT_DANGER) {
-                "STOP! ${closest.name} directly ahead, ${closest.approxSteps} steps away."
-            } else {
-                "Caution: ${closest.name} at ${closest.clockPosition}, ${closest.approxSteps} steps ahead."
+            // Check if closest target is actively approaching across consecutive scans
+            val now = System.currentTimeMillis()
+            val timeDelta = now - lastScanTimeMs
+            val currentDistanceMetric = (1.0f / (closest.approxDistanceMeters.toFloat() + 0.1f))
+            val isApproaching = lastScanTimeMs > 0L &&
+                    timeDelta in 300L..6000L &&
+                    lastObjectName == closest.name &&
+                    currentDistanceMetric > lastObjectAreaMetric * 1.22f
+
+            lastObjectAreaMetric = currentDistanceMetric
+            lastObjectName = closest.name
+            lastScanTimeMs = now
+
+            val finalObstacles = mlKitObstacles.map {
+                if (it == closest && isApproaching) it.copy(isApproaching = true) else it
+            }
+
+            val alertText = when {
+                isApproaching && closest.name == "Person" -> {
+                    if (severity == HazardSeverity.IMMINENT_DANGER) {
+                        "STOP! Person approaching directly ahead!"
+                    } else {
+                        "Caution: Person approaching at ${closest.clockPosition}, ${closest.approxSteps} steps ahead."
+                    }
+                }
+                isApproaching && closest.name == "Animal" -> {
+                    "Caution: Animal moving toward your path at ${closest.clockPosition}."
+                }
+                isApproaching -> {
+                    "Caution: ${closest.name} approaching at ${closest.clockPosition}."
+                }
+                severity == HazardSeverity.IMMINENT_DANGER -> {
+                    "STOP! ${closest.name} directly ahead, ${closest.approxSteps} steps away."
+                }
+                else -> {
+                    "Caution: ${closest.name} at ${closest.clockPosition}, ${closest.approxSteps} steps ahead."
+                }
             }
 
             return HazardAssessment(
                 severity = severity,
                 spokenAlert = alertText,
                 detailedSummary = "On-device detection found ${mlKitObstacles.size} obstacle(s) in field of view.",
-                obstacles = mlKitObstacles,
+                obstacles = finalObstacles,
                 isOfflineEngine = true
             )
         }
@@ -188,11 +250,24 @@ class OnDeviceSafetyEngine {
                             }
                             val approxSteps = (approxDist / 0.7).toInt().coerceAtLeast(1)
 
-                            val label = obj.labels.firstOrNull()?.text ?: "Obstacle"
+                            val boxWidth = box.width().toFloat()
+                            val boxHeight = box.height().toFloat()
+                            val aspectRatio = boxHeight / boxWidth.coerceAtLeast(1f)
+
+                            val rawLabel = obj.labels.firstOrNull()?.text?.lowercase().orEmpty()
+                            val detectedType = when {
+                                rawLabel.contains("person") || rawLabel.contains("human") -> "Person"
+                                rawLabel.contains("dog") || rawLabel.contains("cat") || rawLabel.contains("animal") -> "Animal"
+                                // Upright vertical silhouette: Human
+                                aspectRatio >= 1.6f && box.bottom > height * 0.5f -> "Person"
+                                // Low-profile horizontal silhouette: Animal (dog, cat, pet)
+                                aspectRatio in 0.5f..1.3f && box.bottom > height * 0.65f && boxAreaPercent in 0.04f..0.35f -> "Animal"
+                                else -> obj.labels.firstOrNull()?.text ?: "Obstacle"
+                            }
 
                             obstacles.add(
                                 DetectedObstacle(
-                                    name = label,
+                                    name = detectedType,
                                     clockPosition = clockPos,
                                     approxDistanceMeters = approxDist,
                                     approxSteps = approxSteps,
@@ -208,6 +283,70 @@ class OnDeviceSafetyEngine {
                     continuation.resume(emptyList())
                 }
         }
+    }
+
+    /**
+     * Detects potholes, open holes, or sunken pavement depressions in the forward walking corridor.
+     */
+    fun detectPotholeOrGroundCavity(bitmap: Bitmap): Boolean {
+        val width = bitmap.width
+        val height = bitmap.height
+        val startY = (height * 0.55).toInt()
+        val endY = (height * 0.85).toInt()
+        val startX = (width * 0.25).toInt()
+        val endX = (width * 0.75).toInt()
+        val step = (width / 25).coerceAtLeast(4)
+
+        var totalLum = 0.0
+        var totalSamples = 0
+        val cellLuminance = mutableListOf<Double>()
+
+        for (y in startY until endY step step) {
+            for (x in startX until endX step step) {
+                val lum = getLuminance(bitmap.getPixel(x, y)).toDouble()
+                totalLum += lum
+                totalSamples++
+                cellLuminance.add(lum)
+            }
+        }
+
+        if (totalSamples < 12) return false
+        val avgPavementLum = totalLum / totalSamples
+        if (avgPavementLum < 30.0) return false // Too dark to distinguish pothole from dark scene
+
+        // Count dark cells representing an enclosed cavity/pothole
+        val darkDepressionCount = cellLuminance.count { it < avgPavementLum * 0.45 }
+        val depressionRatio = darkDepressionCount.toDouble() / totalSamples
+
+        // A localized hole typically occupies between 6% and 35% of the forward corridor
+        return depressionRatio in 0.06..0.38
+    }
+
+    /**
+     * Distinguishes descending stairs (downward drop) from ascending stairs (upward steps).
+     */
+    fun isStairsDescending(bitmap: Bitmap): Boolean {
+        val width = bitmap.width
+        val height = bitmap.height
+        val midY = (height * 0.70).toInt()
+        val lowerY = (height * 0.88).toInt().coerceAtMost(height - 1)
+
+        var midLum = 0.0
+        var lowerLum = 0.0
+        var count = 0
+
+        for (x in (width * 0.35).toInt() until (width * 0.65).toInt() step 6) {
+            midLum += getLuminance(bitmap.getPixel(x, midY))
+            lowerLum += getLuminance(bitmap.getPixel(x, lowerY))
+            count++
+        }
+
+        if (count == 0) return true
+        val avgMid = midLum / count
+        val avgLower = lowerLum / count
+
+        // In descending stairs, the steps drop away into lower shadow (mid/lower drops below near foot)
+        return avgMid < avgLower * 0.75 || avgMid < 30.0
     }
 
     private fun getLuminance(pixel: Int): Int {

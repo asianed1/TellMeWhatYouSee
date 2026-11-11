@@ -11,7 +11,7 @@ import org.robolectric.RobolectricTestRunner
 import org.robolectric.annotation.Config
 
 @RunWith(RobolectricTestRunner::class)
-@Config(sdk = [34])
+@Config(sdk = [36])
 class OnDeviceSafetyEngineTest {
 
     private val engine = OnDeviceSafetyEngine()
@@ -64,5 +64,30 @@ class OnDeviceSafetyEngineTest {
 
         val hasDropOff = engine.detectGroundDiscontinuity(bitmap)
         assertTrue("Sudden black void in ground walking zone should trigger drop-off detection", hasDropOff)
+    }
+
+    @Test
+    fun `pothole cavity in pavement triggers pothole detection`() {
+        val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.LTGRAY) // Light asphalt/concrete pavement
+
+        // Draw an enclosed dark pothole cavity in the forward walking corridor (e.g. y: 125-150, x: 75-125)
+        for (y in 125 until 150) {
+            for (x in 75 until 125) {
+                bitmap.setPixel(x, y, Color.BLACK)
+            }
+        }
+
+        val hasPothole = engine.detectPotholeOrGroundCavity(bitmap)
+        assertTrue("Localized dark cavity in ground corridor should detect pothole", hasPothole)
+    }
+
+    @Test
+    fun `uniform pavement does not trigger pothole`() {
+        val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.LTGRAY)
+
+        val hasPothole = engine.detectPotholeOrGroundCavity(bitmap)
+        assertFalse("Uniform pavement must not trigger pothole", hasPothole)
     }
 }

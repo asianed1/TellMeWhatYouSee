@@ -93,10 +93,11 @@ class VisionAssistantViewModel(
 
             // 1. Analyze frame luminance for darkness & auto-torch
             val lux = sensorAnalyzer.analyzeFrameLuminance(bitmap)
-            if (lux < 15f && !_uiState.value.isTorchActive) {
+            // Proactively illuminate at night or in dim indoor hallways (< 35 lux)
+            if (lux < 35f && !_uiState.value.isTorchActive) {
                 setTorch(true)
                 feedbackController.playTorchToggled(true)
-                feedbackController.speakInformative("Low light. Flashlight turned on.")
+                feedbackController.speakInformative("Low light detected. Flashlight turned on.")
             }
 
             try {
@@ -233,16 +234,20 @@ class VisionAssistantViewModel(
         title: String,
         spoken: String?,
         obstacles: List<DetectedObstacle> = emptyList(),
-        hasStairs: Boolean = false,
-        hasDropOff: Boolean = false
+        hasStairsDown: Boolean = false,
+        hasStairsUp: Boolean = false,
+        hasDropOff: Boolean = false,
+        hasPothole: Boolean = false
     ) {
         val assessment = HazardAssessment(
             severity = severity,
             spokenAlert = spoken,
             detailedSummary = title,
             obstacles = obstacles,
-            hasStairsDown = hasStairs,
+            hasStairsDown = hasStairsDown,
+            hasStairsUp = hasStairsUp,
             hasDropOff = hasDropOff,
+            hasPotholeOrVoid = hasPothole,
             isOfflineEngine = !_uiState.value.isOnline
         )
         feedbackController.dispatchAssessment(assessment)

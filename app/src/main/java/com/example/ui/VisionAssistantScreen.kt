@@ -215,21 +215,25 @@ fun VisionAssistantScreen(
                 alertText = uiState.lastAlertText,
                 isAnalyzing = uiState.isAnalyzing,
                 isOffline = !uiState.isOnline,
-                hasStairs = uiState.currentAssessment?.hasStairsDown == true,
+                hasStairsDown = uiState.currentAssessment?.hasStairsDown == true,
+                hasStairsUp = uiState.currentAssessment?.hasStairsUp == true,
                 hasDropOff = uiState.currentAssessment?.hasDropOff == true,
+                hasPothole = uiState.currentAssessment?.hasPotholeOrVoid == true,
                 onTapScan = { viewModel.onUserTriggerScan() }
             )
 
             // BOTTOM: OBSTACLES RADAR & SIMULATOR TEST PANEL
             BottomAssistancePanel(
                 obstacles = uiState.currentAssessment?.obstacles ?: emptyList(),
-                onSimulate = { severity, title, spoken, stairs, dropOff ->
+                onSimulate = { severity, title, spoken, stairsDown, stairsUp, dropOff, pothole ->
                     viewModel.simulateHazard(
                         severity = severity,
                         title = title,
                         spoken = spoken,
-                        hasStairs = stairs,
-                        hasDropOff = dropOff
+                        hasStairsDown = stairsDown,
+                        hasStairsUp = stairsUp,
+                        hasDropOff = dropOff,
+                        hasPothole = pothole
                     )
                 }
             )
@@ -371,8 +375,10 @@ fun CenterHazardHero(
     alertText: String,
     isAnalyzing: Boolean,
     isOffline: Boolean,
-    hasStairs: Boolean,
+    hasStairsDown: Boolean,
+    hasStairsUp: Boolean,
     hasDropOff: Boolean,
+    hasPothole: Boolean,
     onTapScan: () -> Unit
 ) {
     val cardColor = when (severity) {
@@ -463,14 +469,21 @@ fun CenterHazardHero(
                     textAlign = TextAlign.Center
                 )
 
-                if (hasStairs || hasDropOff) {
+                if (hasStairsDown || hasStairsUp || hasDropOff || hasPothole) {
                     Spacer(modifier = Modifier.height(10.dp))
                     Surface(
                         color = Color.Black.copy(alpha = 0.35f),
                         shape = RoundedCornerShape(8.dp)
                     ) {
+                        val badgeText = when {
+                            hasStairsDown -> "⚠️ DESCENDING STAIRS DETECTED"
+                            hasStairsUp -> "⚠️ ASCENDING STAIRS DETECTED"
+                            hasPothole -> "⚠️ POTHOLE / GROUND HOLE DETECTED"
+                            hasDropOff -> "⚠️ DROP-OFF AHEAD"
+                            else -> "⚠️ HAZARD DETECTED"
+                        }
                         Text(
-                            text = if (hasStairs) "⚠️ DESCENDING STAIRS DETECTED" else "⚠️ DROP-OFF AHEAD",
+                            text = badgeText,
                             color = Color.White,
                             fontSize = 12.sp,
                             fontWeight = FontWeight.Bold,
@@ -516,7 +529,7 @@ fun CenterHazardHero(
 @Composable
 fun BottomAssistancePanel(
     obstacles: List<DetectedObstacle>,
-    onSimulate: (HazardSeverity, String, String?, Boolean, Boolean) -> Unit
+    onSimulate: (HazardSeverity, String, String?, Boolean, Boolean, Boolean, Boolean) -> Unit
 ) {
     var showSimulator by remember { mutableStateOf(false) }
 
@@ -604,6 +617,7 @@ fun BottomAssistancePanel(
                     )
                     Spacer(modifier = Modifier.height(8.dp))
 
+                    // Row 1: Critical Fall Hazards & Potholes
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
@@ -616,6 +630,8 @@ fun BottomAssistancePanel(
                                     "Concrete staircase going downwards",
                                     "STOP! Stairs going down directly ahead, 2 steps away.",
                                     true,
+                                    false,
+                                    false,
                                     false
                                 )
                             },
@@ -623,18 +639,20 @@ fun BottomAssistancePanel(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier
                                 .weight(1f)
-                                .testTag("sim_stairs_button")
+                                .testTag("sim_stairs_down_button")
                         ) {
-                            Text("Stairs Down", fontSize = 11.sp, color = Color.White)
+                            Text("Stairs Down", fontSize = 10.sp, color = Color.White)
                         }
 
-                        // Scenario 2: Drop-Off Void
+                        // Scenario 2: Ground Pothole
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Curved subway platform edge",
-                                    "STOP! Drop-off detected directly ahead, 1 step away.",
+                                    "Deep asphalt pothole cavity",
+                                    "STOP! Pothole directly ahead in walking path.",
+                                    false,
+                                    false,
                                     false,
                                     true
                                 )
@@ -643,18 +661,72 @@ fun BottomAssistancePanel(
                             shape = RoundedCornerShape(8.dp),
                             modifier = Modifier
                                 .weight(1f)
-                                .testTag("sim_dropoff_button")
+                                .testTag("sim_pothole_button")
                         ) {
-                            Text("Drop-Off", fontSize = 11.sp, color = Color.White)
+                            Text("Pothole", fontSize = 10.sp, color = Color.White)
                         }
 
-                        // Scenario 3: Caution Obstacle
+                        // Scenario 3: Drop-Off Void
+                        Button(
+                            onClick = {
+                                onSimulate(
+                                    HazardSeverity.IMMINENT_DANGER,
+                                    "Curved subway platform edge",
+                                    "STOP! Drop-off detected directly ahead, 1 step away.",
+                                    false,
+                                    false,
+                                    true,
+                                    false
+                                )
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = DangerRed),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("sim_dropoff_button")
+                        ) {
+                            Text("Drop-Off", fontSize = 10.sp, color = Color.White)
+                        }
+                    }
+
+                    Spacer(modifier = Modifier.height(6.dp))
+
+                    // Row 2: Ascending Stairs, Static Obstacles, Clear Path
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        // Scenario 4: Ascending Stairs (Navigable elevation)
+                        Button(
+                            onClick = {
+                                onSimulate(
+                                    HazardSeverity.CAUTION,
+                                    "Flight of steps leading upward",
+                                    "Caution: Steps going up directly ahead, 2 steps away.",
+                                    false,
+                                    true,
+                                    false,
+                                    false
+                                )
+                            },
+                            colors = ButtonDefaults.buttonColors(containerColor = CautionAmber),
+                            shape = RoundedCornerShape(8.dp),
+                            modifier = Modifier
+                                .weight(1f)
+                                .testTag("sim_stairs_up_button")
+                        ) {
+                            Text("Stairs Up", fontSize = 10.sp, color = Color.Black)
+                        }
+
+                        // Scenario 5: Obstacle at 1 o'clock
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.CAUTION,
                                     "Trash can at 1 o'clock",
                                     "Caution: Trash can at 1 o'clock, 3 steps ahead.",
+                                    false,
+                                    false,
                                     false,
                                     false
                                 )
@@ -665,16 +737,18 @@ fun BottomAssistancePanel(
                                 .weight(1f)
                                 .testTag("sim_caution_button")
                         ) {
-                            Text("Obstacle", fontSize = 11.sp, color = Color.Black)
+                            Text("Obstacle", fontSize = 10.sp, color = Color.Black)
                         }
 
-                        // Scenario 4: Clear Path (Quiet-by-Default)
+                        // Scenario 6: Clear Path (Quiet-by-Default)
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.SAFE,
                                     "Open sidewalk path",
                                     null, // Silent under Quiet-by-Default!
+                                    false,
+                                    false,
                                     false,
                                     false
                                 )
@@ -685,7 +759,7 @@ fun BottomAssistancePanel(
                                 .weight(1f)
                                 .testTag("sim_safe_button")
                         ) {
-                            Text("Clear", fontSize = 11.sp, color = Color.Black)
+                            Text("Clear", fontSize = 10.sp, color = Color.Black)
                         }
                     }
                 }

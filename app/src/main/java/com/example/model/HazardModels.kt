@@ -38,7 +38,8 @@ data class DetectedObstacle(
     val clockPosition: String, // e.g. "12 o'clock", "1 o'clock", "11 o'clock"
     val approxDistanceMeters: Double,
     val approxSteps: Int,
-    val elevation: String // "Ground level", "Knee level", "Head/Torso level"
+    val elevation: String, // "Ground level", "Knee level", "Head/Torso level"
+    val isApproaching: Boolean = false
 )
 
 /**
@@ -50,7 +51,9 @@ data class HazardAssessment(
     val detailedSummary: String?, // Available if user double-taps for details
     val obstacles: List<DetectedObstacle> = emptyList(),
     val hasStairsDown: Boolean = false,
+    val hasStairsUp: Boolean = false,
     val hasDropOff: Boolean = false,
+    val hasPotholeOrVoid: Boolean = false,
     val hasHeadOverhang: Boolean = false,
     val isOfflineEngine: Boolean = false,
     val timestampMs: Long = System.currentTimeMillis(),

@@ -37,8 +37,14 @@ class GeminiVisionHazardService {
             "has_stairs_down" to Schema.boolean(
                 description = "True if descending stairs or steps going downward are present directly in path"
             ),
+            "has_stairs_up" to Schema.boolean(
+                description = "True if ascending steps going upward are present in path"
+            ),
             "has_drop_off" to Schema.boolean(
                 description = "True if an abrupt drop-off, curb edge, or platform gap is detected"
+            ),
+            "has_pothole_or_hole" to Schema.boolean(
+                description = "True if an open hole, road pothole, sunken grate, or pavement depression is in path"
             ),
             "has_head_overhang" to Schema.boolean(
                 description = "True if low-hanging branches, awnings, or signs are present at head/chest height"
@@ -46,7 +52,7 @@ class GeminiVisionHazardService {
             "obstacles" to Schema.array(
                 items = Schema.obj(
                     properties = mapOf(
-                        "name" to Schema.string(description = "Identified object name, e.g. chair, bollard, curb"),
+                        "name" to Schema.string(description = "Identified object name, e.g. chair, bollard, curb, pothole"),
                         "clock_position" to Schema.string(description = "Clock direction e.g. 12 o'clock, 1 o'clock, 11 o'clock"),
                         "distance_meters" to Schema.double(description = "Estimated distance in meters"),
                         "elevation" to Schema.string(description = "Ground level, Knee level, or Head level")
@@ -78,13 +84,23 @@ class GeminiVisionHazardService {
                 You are the safety vision engine for a visually impaired user walking forward.
                 Analyze the image strictly for physical hazards in the direct walking path within the camera field of view.
                 
+                NIGHT & LOW-LIGHT INSTRUCTION:
+                Inspect ground shadows and flash highlights. Holes, potholes, and downward steps often appear as sharp shadow edges or abrupt dark voids.
+                
                 SAFETY RULES:
-                1. IMMINENT_DANGER: Descending stairs/steps going down, drop-offs, open holes, platform gaps, head-height branches/awnings, or physical barriers blocking the path within 2 meters.
-                   Spoken format: 'STOP! [Hazard] directly ahead, [X] steps away.'
-                2. CAUTION: Curbs, parked bikes, poles, trash cans, or obstacles on path.
-                   Spoken format: 'Caution: [Obstacle] at [Clock Direction], [X] steps ahead.'
-                3. SAFE: If the forward path is clear or obstacles are far/harmless.
-                   UNDER QUIET-BY-DEFAULT: spoken_alert MUST BE AN EMPTY STRING (""). Do NOT output pleasantries or say 'path is clear'.
+                1. IMMINENT_DANGER (Demand STOP):
+                   - Descending stairs / steps going DOWN (high risk of fall): 'STOP! Stairs going down directly ahead, [X] steps away.'
+                   - Potholes, open holes, sunken grates, or trenches directly in path: 'STOP! Pothole directly ahead in your path.'
+                   - Drop-offs, subway/train platform edges, elevated curbs: 'STOP! Drop-off directly ahead.'
+                   - Hard barriers or head-height overhanging branches within 2 meters.
+                
+                2. CAUTION (Navigable or Offset Hazard):
+                   - Ascending stairs / steps going UP (navigable elevation): 'Caution: Steps going up directly ahead, [X] steps away.'
+                   - Pothole or curb offset to the side: 'Caution: Pothole on your right at [Clock Direction], [X] steps ahead.'
+                   - Parked bikes, chairs, poles, trash cans.
+                
+                3. SAFE (Quiet-by-Default):
+                   - If path is clear or obstacles are far/harmless: spoken_alert MUST BE AN EMPTY STRING (""). Do NOT speak.
             """.trimIndent()
 
             // Realistic 30s timeout
@@ -119,7 +135,9 @@ class GeminiVisionHazardService {
         val spokenAlert = root.optString("spoken_alert").trim().takeIf { it.isNotEmpty() }
         val detailedSummary = root.optString("detailed_summary").trim().takeIf { it.isNotEmpty() }
         val hasStairsDown = root.optBoolean("has_stairs_down", false)
+        val hasStairsUp = root.optBoolean("has_stairs_up", false)
         val hasDropOff = root.optBoolean("has_drop_off", false)
+        val hasPothole = root.optBoolean("has_pothole_or_hole", false)
         val hasHeadOverhang = root.optBoolean("has_head_overhang", false)
 
         val obstaclesList = mutableListOf<DetectedObstacle>()
@@ -151,7 +169,9 @@ class GeminiVisionHazardService {
             detailedSummary = detailedSummary ?: "Path is clear.",
             obstacles = obstaclesList,
             hasStairsDown = hasStairsDown,
+            hasStairsUp = hasStairsUp,
             hasDropOff = hasDropOff,
+            hasPotholeOrVoid = hasPothole,
             hasHeadOverhang = hasHeadOverhang,
             isOfflineEngine = false
         )
