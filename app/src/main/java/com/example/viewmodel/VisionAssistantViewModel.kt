@@ -83,6 +83,33 @@ class VisionAssistantViewModel(
     }
 
     /**
+     * Captures a frame. At night or in low-light (< 35 lux), triggers a synchronized
+     * quick flash pulse (turns torch on for ~260ms for sensor 3A convergence, captures
+     * the illuminated frame, and immediately turns it off).
+     */
+    private suspend fun captureFrameWithFlashPulse(): Bitmap? {
+        val isLowLight = sensorAnalyzer.isLowLight()
+        val shouldPulse = isLowLight && !_uiState.value.isTorchActive
+
+        return if (shouldPulse) {
+            try {
+                // Fire quick light flash pulse
+                torchController?.invoke(true)
+                delay(260L) // Allow camera sensor 3A (Auto-Exposure/Auto-Focus) to settle under light
+                frameProvider?.invoke()
+            } catch (e: Exception) {
+                Log.w(TAG, "Flash pulse capture encountered error", e)
+                frameProvider?.invoke()
+            } finally {
+                // Extinguish light immediately
+                torchController?.invoke(false)
+            }
+        } else {
+            frameProvider?.invoke()
+        }
+    }
+
+    /**
      * Executes analysis of the provided bitmap.
      */
     fun analyzeBitmap(bitmap: Bitmap) {
@@ -91,28 +118,32 @@ class VisionAssistantViewModel(
         viewModelScope.launch {
             _uiState.value = _uiState.value.copy(isAnalyzing = true, errorMessage = null)
 
-            // 1. Analyze frame luminance for darkness & auto-torch
+            // 1. Analyze frame luminance for darkness telemetry
             val lux = sensorAnalyzer.analyzeFrameLuminance(bitmap)
-            // Proactively illuminate at night or in dim indoor hallways (< 35 lux)
-            if (lux < 35f && !_uiState.value.isTorchActive) {
-                setTorch(true)
-                feedbackController.playTorchToggled(true)
-                feedbackController.speakInformative("Low light detected. Flashlight turned on.")
+
+            // If an un-pulsed first capture was pitch black (< 18 lux), quickly re-capture with flash pulse
+            var targetBitmap = bitmap
+            if (lux < 18f && !_uiState.value.isTorchActive) {
+                val pulsed = captureFrameWithFlashPulse()
+                if (pulsed != null) {
+                    targetBitmap = pulsed
+                    sensorAnalyzer.analyzeFrameLuminance(targetBitmap)
+                }
             }
 
             try {
                 val isOnline = _uiState.value.isOnline
                 val assessment = if (isOnline) {
                     try {
-                        geminiService.analyzeFrame(bitmap)
+                        geminiService.analyzeFrame(targetBitmap)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Cloud AI failed, falling back to local safety engine", e)
-                        onDeviceSafetyEngine.analyzeFrame(bitmap)
+                        onDeviceSafetyEngine.analyzeFrame(targetBitmap)
                     }
                 } else {
-                    onDeviceSafetyEngine.analyzeFrame(bitmap)
+                    onDeviceSafetyEngine.analyzeFrame(targetBitmap)
                 }
 
                 // Multi-sensory feedback dispatch
@@ -146,7 +177,7 @@ class VisionAssistantViewModel(
      */
     fun onUserTriggerScan() {
         viewModelScope.launch {
-            val bmp = frameProvider?.invoke()
+            val bmp = captureFrameWithFlashPulse()
             if (bmp != null) {
                 analyzeBitmap(bmp)
             } else {
@@ -180,9 +211,11 @@ class VisionAssistantViewModel(
         continuousScanJob?.cancel()
         continuousScanJob = viewModelScope.launch {
             while (_uiState.value.operatingMode == OperatingMode.CONTINUOUS_AUTO) {
-                val bmp = frameProvider?.invoke()
-                if (bmp != null && !_uiState.value.isAnalyzing) {
-                    analyzeBitmap(bmp)
+                if (!_uiState.value.isAnalyzing) {
+                    val bmp = captureFrameWithFlashPulse()
+                    if (bmp != null) {
+                        analyzeBitmap(bmp)
+                    }
                 }
                 delay(3000L)
             }
