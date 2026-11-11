@@ -67,8 +67,14 @@ android {
     unitTests {
       isIncludeAndroidResources = true
       all {
-        it.systemProperty("robolectric.offline", "true")
-        it.systemProperty("robolectric.dependency.dir", "/home/appuser/.m2/repository/org/robolectric/android-all-instrumented/16-robolectric-13921718-i7")
+        // In local AI Studio container environment without outbound internet during builds,
+        // use the pre-cached SDK jar if present. On GitHub Actions or other CI runners,
+        // allow Robolectric to download required artifacts normally via Maven Central.
+        val localRobolectricDir = file("/home/appuser/.m2/repository/org/robolectric/android-all-instrumented/16-robolectric-13921718-i7")
+        if (localRobolectricDir.exists() && System.getenv("GITHUB_ACTIONS") == null && System.getenv("CI") == null) {
+          it.systemProperty("robolectric.offline", "true")
+          it.systemProperty("robolectric.dependency.dir", localRobolectricDir.absolutePath)
+        }
       }
     }
   }
