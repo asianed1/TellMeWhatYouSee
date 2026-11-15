@@ -20,7 +20,9 @@ data class DepthMapResult(
     val depthGrid: FloatArray,
     val size: Int = DEPTH_INPUT_SIZE,
     val rawRange: Float = 0f,
-    val activeAccelerator: String = "CPU"
+    val activeAccelerator: String = "CPU",
+    val rawMedian: Float = 0f,
+    val rawP98: Float = 1f
 )
 
 interface DepthEstimator : Closeable {
@@ -46,6 +48,15 @@ class MiDaSDepthEstimator(
     // Reusable buffers to minimize GC allocation per snapshot
     private val pixelBuffer = IntArray(DEPTH_INPUT_SIZE * DEPTH_INPUT_SIZE)
     private val floatInputBuffer = FloatArray(DEPTH_INPUT_SIZE * DEPTH_INPUT_SIZE * 3)
+    private val workingBitmap: Bitmap = Bitmap.createBitmap(
+        DEPTH_INPUT_SIZE,
+        DEPTH_INPUT_SIZE,
+        Bitmap.Config.ARGB_8888
+    )
+    private val workingCanvas = android.graphics.Canvas(workingBitmap)
+    private val cropPaint = android.graphics.Paint(android.graphics.Paint.FILTER_BITMAP_FLAG)
+    private val srcRect = android.graphics.Rect()
+    private val dstRect = android.graphics.Rect(0, 0, DEPTH_INPUT_SIZE, DEPTH_INPUT_SIZE)
 
     override fun warmUp(): Boolean {
         synchronized(lock) {
@@ -87,14 +98,20 @@ class MiDaSDepthEstimator(
             val model = compiledModel ?: return null
             if (inputBuffers.isEmpty() || outputBuffers.isEmpty()) return null
 
-            val scaledBitmap = if (bitmap.width == DEPTH_INPUT_SIZE && bitmap.height == DEPTH_INPUT_SIZE) {
+            val inputBitmap = if (bitmap.width == DEPTH_INPUT_SIZE && bitmap.height == DEPTH_INPUT_SIZE) {
                 bitmap
             } else {
-                Bitmap.createScaledBitmap(bitmap, DEPTH_INPUT_SIZE, DEPTH_INPUT_SIZE, true)
+                // Aspect-preserving square center-crop avoids vertical distortion on 4:3 / 16:9 portrait frames
+                val side = minOf(bitmap.width, bitmap.height)
+                val cropX = (bitmap.width - side) / 2
+                val cropY = (bitmap.height - side) / 2
+                srcRect.set(cropX, cropY, cropX + side, cropY + side)
+                workingCanvas.drawBitmap(bitmap, srcRect, dstRect, cropPaint)
+                workingBitmap
             }
 
             return try {
-                scaledBitmap.getPixels(
+                inputBitmap.getPixels(
                     pixelBuffer,
                     0,
                     DEPTH_INPUT_SIZE,
@@ -125,10 +142,6 @@ class MiDaSDepthEstimator(
             } catch (t: Throwable) {
                 Log.e(TAG, "MiDaS depth inference failed", t)
                 null
-            } finally {
-                if (scaledBitmap !== bitmap && !scaledBitmap.isRecycled) {
-                    scaledBitmap.recycle()
-                }
             }
         }
     }
@@ -151,6 +164,7 @@ class MiDaSDepthEstimator(
         samples.sort()
 
         val p2 = samples[(sampleCount * 0.02f).toInt().coerceIn(0, sampleCount - 1)]
+        val p50 = samples[(sampleCount * 0.50f).toInt().coerceIn(0, sampleCount - 1)]
         val p98 = samples[(sampleCount * 0.98f).toInt().coerceIn(0, sampleCount - 1)]
         val range = (p98 - p2).coerceAtLeast(1e-4f)
 
@@ -163,7 +177,9 @@ class MiDaSDepthEstimator(
             depthGrid = normalized,
             size = DEPTH_INPUT_SIZE,
             rawRange = range,
-            activeAccelerator = activeAcceleratorName
+            activeAccelerator = activeAcceleratorName,
+            rawMedian = p50,
+            rawP98 = p98
         )
     }
 

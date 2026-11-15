@@ -44,15 +44,16 @@ class OnDeviceSafetyEngine(
     )
 
     /**
-     * Evaluates a camera snapshot completely on-device according to the user's aim intent.
+     * Evaluates a camera snapshot completely on-device according to the user's aim intent and pitch.
      */
     fun analyzeFrame(
         bitmap: Bitmap,
-        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
+        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH,
+        pitchDegrees: Float = 0f
     ): HazardAssessment {
         val depthResult = depthEstimator?.estimateDepthMap(bitmap)
         if (depthResult != null && depthResult.depthGrid.size >= depthResult.size * depthResult.size) {
-            return analyzeDepthMap(depthResult, bitmap, aimZone)
+            return analyzeDepthMap(depthResult, bitmap, aimZone, pitchDegrees)
         }
 
         // Fallback if native LiteRT depth estimator is not attached (e.g., unsupported hardware)
@@ -66,7 +67,8 @@ class OnDeviceSafetyEngine(
     fun analyzeDepthMap(
         depthResult: DepthMapResult,
         bitmap: Bitmap? = null,
-        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
+        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH,
+        pitchDegrees: Float = 0f
     ): HazardAssessment {
         // Featureless / covered lens guard: flat uniform depth has near-zero dynamic range
         if (depthResult.rawRange in 0.0001f..0.04f) {
@@ -77,23 +79,29 @@ class OnDeviceSafetyEngine(
         val size = depthResult.size
         val candidates = mutableListOf<ZoneDetection>()
 
+        // Continuous pitch compensation inside FORWARD_PATH (-14..+14 deg):
+        // Negative pitch (slightly downward) shifts horizon up (smaller y); positive shifts down.
+        val pitchShiftY = if (aimZone == CameraAimZone.FORWARD_PATH) {
+            (pitchDegrees.coerceIn(-14f, 14f) * 2.5f).toInt()
+        } else 0
+
         // 1. Check Ground Plane Hazards (holes, drop-offs, downward stairs, ground protrusions)
         if (aimZone != CameraAimZone.OVERHEAD_CLEARANCE) {
-            val groundHazard = detectGroundPlaneHazard(grid, size, bitmap, aimZone)
+            val groundHazard = detectGroundPlaneHazard(grid, size, bitmap, aimZone, pitchShiftY)
             if (groundHazard != null) {
                 candidates.add(groundHazard)
             }
         }
 
         // 2. Check Protruding Spatial Obstacles across Overhead, Eye-Level, and Knee tiers
-        val protruding = detectProtrudingObstacles(grid, size, aimZone)
+        val protruding = detectProtrudingObstacles(grid, size, aimZone, pitchShiftY)
         candidates.addAll(protruding)
 
         if (candidates.isEmpty()) {
             return HazardAssessment.clearSafe(isOffline = true)
         }
 
-        // Merge Knee + Eye-Level within the same lane (tall trunk/person/wall promotes to Eye-Level)
+        // Merge vertical spans within the same lane (Knee+Eye or Eye+Overhead -> Eye-Level)
         val merged = mergeVerticalSpansByLane(candidates)
 
         // Pick highest-priority hazard for ultra-concise single-sentence delivery
@@ -138,11 +146,20 @@ class OnDeviceSafetyEngine(
         grid: FloatArray,
         size: Int,
         bitmap: Bitmap?,
-        aimZone: CameraAimZone
+        aimZone: CameraAimZone,
+        pitchShiftY: Int = 0
     ): ZoneDetection? {
-        val scanTopY = if (aimZone == CameraAimZone.GROUND_NEAR) 96 else 186
+        val scanTopY = if (aimZone == CameraAimZone.GROUND_NEAR) {
+            96
+        } else {
+            (186 + pitchShiftY).coerceIn(156, 200)
+        }
         val scanBottomY = 236
-        val midSplitY = if (aimZone == CameraAimZone.GROUND_NEAR) 172 else 206
+        val midSplitY = if (aimZone == CameraAimZone.GROUND_NEAR) {
+            172
+        } else {
+            (scanTopY + 18).coerceIn(184, 214)
+        }
 
         // A. Downward Drop-Off / Stairwell Cliff Check along center walking lane
         val nearFootDepth = regionMean(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 212, 238)
@@ -229,13 +246,25 @@ class OnDeviceSafetyEngine(
     private fun detectProtrudingObstacles(
         grid: FloatArray,
         size: Int,
-        aimZone: CameraAimZone
+        aimZone: CameraAimZone,
+        pitchShiftY: Int = 0
     ): List<ZoneDetection> {
         val found = mutableListOf<ZoneDetection>()
 
-        // Baseline background depths per band to distinguish real protruding mass from far horizon
-        val overheadBg = regionPercentile(grid, size, 16, 240, 12, 66, 0.40f)
-        val eyeBg = regionPercentile(grid, size, 16, 240, 66, 136, 0.40f)
+        val ohStart = 6
+        val ohEnd = (48 + pitchShiftY).coerceIn(24, 72)
+        val eyeStart = (60 + pitchShiftY).coerceIn(32, 92)
+        val eyeEnd = (136 + pitchShiftY).coerceIn(106, 166)
+        val kneeStart = eyeEnd
+        val kneeEnd = (kneeStart + 50).coerceIn(156, 206)
+
+        // Baseline background depths + global far horizon anchor (immune to wide center cars/barriers)
+        val overheadBg = regionPercentile(grid, size, 16, 240, ohStart, ohEnd, 0.40f)
+        val eyeBg = regionPercentile(grid, size, 16, 240, eyeStart, eyeEnd, 0.40f)
+        val globalFarAnchor = minOf(
+            regionPercentile(grid, size, 16, 240, 4, 42, 0.25f),
+            regionPercentile(grid, size, 16, 240, eyeStart, eyeEnd, 0.15f)
+        )
 
         for (lane in Lane.entries) {
             if (aimZone == CameraAimZone.OVERHEAD_CLEARANCE) {
@@ -250,34 +279,58 @@ class OnDeviceSafetyEngine(
                 continue
             }
 
-            // 1. Overhead band (top ~25%)
-            val ohNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 12, 66, 0.64f)
-            val ohP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 12, 66, 0.80f)
-            if (ohNearFrac >= 0.16f && ohP80 - overheadBg > 0.20f) {
+            // Evaluate Eye-Level metrics first so Overhead can require open clearance underneath
+            val eyeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, eyeStart, eyeEnd, 0.66f)
+            val eyeFarFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, eyeStart, eyeEnd, 0.50f)
+            val eyeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, eyeStart, eyeEnd, 0.80f)
+            val eyeMed = regionPercentile(grid, size, lane.xStart, lane.xEnd, eyeStart, eyeEnd, 0.50f)
+
+            // 1. Overhead band (top ~18% shifted by pitch): ONLY true overhang if open space exists below
+            val ohNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, ohStart, ohEnd, 0.64f)
+            val ohP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, ohStart, ohEnd, 0.80f)
+            val hasClearanceUnderneath = (ohP80 - eyeMed) > 0.18f && eyeMed < 0.52f
+            if (ohNearFrac >= 0.18f && (ohP80 - overheadBg) > 0.20f && hasClearanceUnderneath) {
                 found.add(ZoneDetection(ElevationTier.OVERHEAD, lane, isNear = true, score = ohP80))
             }
 
-            // 2. Eye-Level band (middle-upper horizon)
-            val eyeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.66f)
-            val eyeFarFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.50f)
-            val eyeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.80f)
+            // 2. Eye-Level band (middle-upper horizon) + Wide-Barrier / 2m Car detector for center lane
             if (eyeNearFrac >= 0.18f && eyeP80 > 0.68f) {
                 found.add(ZoneDetection(ElevationTier.EYE_LEVEL, lane, isNear = true, score = eyeP80))
-            } else if (eyeFarFrac >= 0.22f && eyeP80 - eyeBg > 0.20f && eyeP80 > 0.52f) {
+            } else if (eyeFarFrac >= 0.22f && (eyeP80 - eyeBg) > 0.20f && eyeP80 > 0.52f) {
                 found.add(ZoneDetection(ElevationTier.EYE_LEVEL, lane, isNear = false, score = eyeP80))
+            } else if (lane == Lane.AHEAD) {
+                val eyeAheadBlockFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, eyeStart, eyeEnd, 0.42f)
+                val kneeAheadMed = regionPercentile(grid, size, lane.xStart, lane.xEnd, kneeStart, kneeEnd, 0.50f)
+                val isVerticalPlateau = abs(kneeAheadMed - eyeMed) < 0.24f
+                if (eyeMed >= 0.43f &&
+                    eyeP80 >= 0.50f &&
+                    (eyeMed - globalFarAnchor) >= 0.22f &&
+                    eyeAheadBlockFrac >= 0.40f &&
+                    (isVerticalPlateau || eyeMed >= 0.50f)
+                ) {
+                    val isNearBarrier = eyeMed >= 0.48f && eyeP80 >= 0.52f
+                    found.add(
+                        ZoneDetection(
+                            ElevationTier.EYE_LEVEL,
+                            lane,
+                            isNear = isNearBarrier,
+                            score = eyeP80.coerceAtLeast(0.70f)
+                        )
+                    )
+                }
             }
 
             // 3. Knee-Level band (must clearly protrude closer than adjacent floor baseline)
             if (aimZone == CameraAimZone.FORWARD_PATH) {
-                val kneeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 136, 186, 0.80f)
+                val kneeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, kneeStart, kneeEnd, 0.80f)
                 val otherLaneMed = when (lane) {
-                    Lane.AHEAD -> (regionPercentile(grid, size, Lane.LEFT.xStart, Lane.LEFT.xEnd, 136, 186, 0.50f) +
-                        regionPercentile(grid, size, Lane.RIGHT.xStart, Lane.RIGHT.xEnd, 136, 186, 0.50f)) * 0.5f
-                    Lane.LEFT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 136, 186, 0.50f)
-                    Lane.RIGHT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 136, 186, 0.50f)
+                    Lane.AHEAD -> (regionPercentile(grid, size, Lane.LEFT.xStart, Lane.LEFT.xEnd, kneeStart, kneeEnd, 0.50f) +
+                        regionPercentile(grid, size, Lane.RIGHT.xStart, Lane.RIGHT.xEnd, kneeStart, kneeEnd, 0.50f)) * 0.5f
+                    Lane.LEFT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, kneeStart, kneeEnd, 0.50f)
+                    Lane.RIGHT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, kneeStart, kneeEnd, 0.50f)
                 }
-                val kneeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 136, 186, 0.72f)
-                if (kneeNearFrac >= 0.20f && kneeP80 - otherLaneMed > 0.17f) {
+                val kneeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, kneeStart, kneeEnd, 0.72f)
+                if (kneeNearFrac >= 0.20f && (kneeP80 - otherLaneMed) > 0.17f) {
                     found.add(ZoneDetection(ElevationTier.KNEE, lane, isNear = true, score = kneeP80))
                 }
             }
@@ -293,10 +346,15 @@ class OnDeviceSafetyEngine(
         for ((_, laneItems) in byLane) {
             val hasEye = laneItems.firstOrNull { it.tier == ElevationTier.EYE_LEVEL }
             val hasKnee = laneItems.firstOrNull { it.tier == ElevationTier.KNEE }
+            val hasOverhead = laneItems.firstOrNull { it.tier == ElevationTier.OVERHEAD }
 
             for (item in laneItems) {
                 if (item == hasKnee && hasEye != null) {
                     // Skip lower knee alert when eye-level already blocks the same lane
+                    continue
+                }
+                if (item == hasOverhead && hasEye != null) {
+                    // Continuous tall obstacle blocking straight ahead is Eye-Level, not pure Overhead
                     continue
                 }
                 result.add(item)

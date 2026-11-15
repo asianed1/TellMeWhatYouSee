@@ -144,9 +144,13 @@ class VisionAssistantViewModel(
             }
 
             try {
-                val aimZone = _uiState.value.telemetry.aimZone
+                val telemetry = _uiState.value.telemetry
                 val assessment = withContext(Dispatchers.Default) {
-                    onDeviceSafetyEngine.analyzeFrame(targetBitmap, aimZone)
+                    onDeviceSafetyEngine.analyzeFrame(
+                        targetBitmap,
+                        telemetry.aimZone,
+                        telemetry.pitchDegrees
+                    )
                 }
 
                 // Multi-sensory feedback dispatch

@@ -166,6 +166,95 @@ class OnDeviceSafetyEngineTest {
     }
 
     @Test
+    fun `wide parked car two meters ahead is detected even when near pavement dominates top depth scale`() {
+        val grid = buildClearWalkingDepthGrid()
+        // Sky/trees at top remain far (0.05..0.12), while a wide car body fills ALL 3 lanes (y: 62..178)
+        // at ~0.54f because closer pavement at the user's feet (y: 195..255) occupies 0.70..0.90
+        for (y in 62 until 178) {
+            for (x in 16 until 240) {
+                grid[y * gridSize + x] = 0.54f
+            }
+        }
+        val depthMap = DepthMapResult(depthGrid = grid, size = gridSize, rawRange = 0.90f)
+
+        val result = engine.analyzeDepthMap(depthMap, null, CameraAimZone.FORWARD_PATH, pitchDegrees = 0f)
+
+        assertEquals(HazardSeverity.IMMINENT_DANGER, result.severity)
+        assertEquals("STOP! Possible eye-level hazard, near ahead.", result.spokenAlert)
+    }
+
+    @Test
+    fun `tall straight-ahead obstacle reaching top edge reports eye-level rather than overhead hazard`() {
+        val grid = buildClearWalkingDepthGrid()
+        // Solid tall obstacle extending from near top edge (y: 14) down through eye-level (y: 170)
+        for (y in 14 until 170) {
+            for (x in 92 until 164) {
+                grid[y * gridSize + x] = 0.86f
+            }
+        }
+        val depthMap = DepthMapResult(depthGrid = grid, size = gridSize, rawRange = 0.85f)
+
+        val result = engine.analyzeDepthMap(depthMap, null, CameraAimZone.FORWARD_PATH, pitchDegrees = 0f)
+
+        assertEquals(HazardSeverity.IMMINENT_DANGER, result.severity)
+        assertEquals("STOP! Possible eye-level hazard, near ahead.", result.spokenAlert)
+        assertFalse("Continuous straight-ahead obstacle must not trigger overhead", result.hasHeadOverhang)
+    }
+
+    @Test
+    fun `isolated overhanging branch in forward path with open space below triggers overhead hazard`() {
+        val grid = buildClearWalkingDepthGrid()
+        // Low awning/branch across top strip (y: 8..44) while eye-level below (y: 60..136) stays clear/far
+        for (y in 8 until 44) {
+            for (x in 92 until 164) {
+                grid[y * gridSize + x] = 0.84f
+            }
+        }
+        val depthMap = DepthMapResult(depthGrid = grid, size = gridSize, rawRange = 0.85f)
+
+        val result = engine.analyzeDepthMap(depthMap, null, CameraAimZone.FORWARD_PATH, pitchDegrees = 0f)
+
+        assertEquals(HazardSeverity.IMMINENT_DANGER, result.severity)
+        assertEquals("STOP! Possible overhead hazard, near ahead.", result.spokenAlert)
+        assertTrue(result.hasHeadOverhang)
+    }
+
+    @Test
+    fun `clear indoor hallway with flanking walls and open center stays safe`() {
+        val grid = buildClearWalkingDepthGrid()
+        // Side hallway walls in LEFT and RIGHT lanes at moderate depth (0.48f), center AHEAD remains open
+        for (y in 40 until 180) {
+            for (x in 16 until 80) grid[y * gridSize + x] = 0.48f
+            for (x in 176 until 240) grid[y * gridSize + x] = 0.48f
+        }
+        val depthMap = DepthMapResult(depthGrid = grid, size = gridSize, rawRange = 0.85f)
+
+        val result = engine.analyzeDepthMap(depthMap, null, CameraAimZone.FORWARD_PATH, pitchDegrees = 0f)
+
+        assertEquals(HazardSeverity.SAFE, result.severity)
+        assertNull("Clear hallway center should remain silent", result.spokenAlert)
+    }
+
+    @Test
+    fun `slight downward phone tilt shifts eye-level band upward instead of triggering overhead`() {
+        val grid = buildClearWalkingDepthGrid()
+        // With -10 deg pitch (pitchShiftY = -25), eye band shifts to y=35..111.
+        // An obstacle sitting at y=36..108 is eye-level in front of the user, not overhead.
+        for (y in 36 until 108) {
+            for (x in 92 until 164) {
+                grid[y * gridSize + x] = 0.84f
+            }
+        }
+        val depthMap = DepthMapResult(depthGrid = grid, size = gridSize, rawRange = 0.85f)
+
+        val result = engine.analyzeDepthMap(depthMap, null, CameraAimZone.FORWARD_PATH, pitchDegrees = -10f)
+
+        assertEquals(HazardSeverity.IMMINENT_DANGER, result.severity)
+        assertEquals("STOP! Possible eye-level hazard, near ahead.", result.spokenAlert)
+        assertFalse(result.hasHeadOverhang)
+    }
+
+    @Test
     fun `uniform surface does not trigger stairs or dropoff fallback`() {
         val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.GRAY)
