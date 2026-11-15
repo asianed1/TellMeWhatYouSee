@@ -82,6 +82,20 @@ android {
     includeInApk = false
     includeInBundle = true
   }
+  androidResources {
+    noCompress += listOf("tflite")
+  }
+  packaging {
+    jniLibs {
+      pickFirsts += setOf("**/libtensorflowlite_jni.so", "**/libLiteRt.so")
+    }
+  }
+}
+
+tasks.withType<org.jetbrains.kotlin.gradle.tasks.KotlinCompile>().configureEach {
+  compilerOptions {
+    freeCompilerArgs.add("-Xskip-metadata-version-check")
+  }
 }
 
 // Configure the Secrets Gradle Plugin to use .env and .env.example files
@@ -105,7 +119,8 @@ dependencies {
   implementation(libs.androidx.camera.core)
   implementation(libs.androidx.camera.lifecycle)
   implementation(libs.androidx.camera.view)
-  implementation("com.google.mlkit:object-detection:17.0.2")
+  implementation(libs.litert)
+  // implementation("com.google.mlkit:object-detection:17.0.2")
   implementation(libs.androidx.compose.material.icons.core)
   implementation(libs.androidx.compose.material.icons.extended)
   implementation(libs.androidx.compose.material3)

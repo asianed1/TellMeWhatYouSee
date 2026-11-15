@@ -1,172 +1,348 @@
 package com.example.safety
 
 import android.graphics.Bitmap
-import android.graphics.Rect
-import android.util.Log
 import com.example.model.CameraAimZone
 import com.example.model.DetectedObstacle
 import com.example.model.HazardAssessment
 import com.example.model.HazardSeverity
-import com.google.mlkit.vision.common.InputImage
-import com.google.mlkit.vision.objects.ObjectDetection
-import com.google.mlkit.vision.objects.defaults.ObjectDetectorOptions
-import kotlinx.coroutines.suspendCancellableCoroutine
-import kotlin.coroutines.resume
 import kotlin.math.abs
 
-private const val TAG = "OnDeviceSafetyEngine"
-
 /**
- * 100% On-Device Safety Engine. Operates with zero network and zero cloud connectivity.
- * Combines deterministic ground/stair heuristics with local Google ML Kit object detection,
- * adapted to the user's intentional camera aim (straight ahead, ground near, or overhead).
+ * 100% Self-Contained On-Device Safety Engine.
+ * Runs exclusively on local phone hardware using LiteRT monocular depth estimation (MiDaS)
+ * paired with geometric floor-plane and elevation-zone analysis.
+ *
+ * Classifies hazards into 4 actionable elevation tiers without noun guessing:
+ * - Ground hazard (or high-confidence downward stairs)
+ * - Knee hazard
+ * - Eye-level hazard
+ * - Overhead hazard
  */
-class OnDeviceSafetyEngine {
+class OnDeviceSafetyEngine(
+    private val depthEstimator: DepthEstimator? = null
+) {
 
-    private val objectDetector by lazy {
-        val options = ObjectDetectorOptions.Builder()
-            .setDetectorMode(ObjectDetectorOptions.SINGLE_IMAGE_MODE)
-            .enableMultipleObjects()
-            .enableClassification()
-            .build()
-        ObjectDetection.getClient(options)
+    private enum class Lane(val label: String, val xStart: Int, val xEnd: Int) {
+        LEFT("slightly left", 16, 88),
+        AHEAD("ahead", 88, 168),
+        RIGHT("slightly right", 168, 240)
     }
 
-    // Approach tracking state (compares consecutive on-demand or auto scans)
-    private var lastObjectDistanceMetric: Float = 0f
-    private var lastObjectName: String = ""
-    private var lastScanTimeMs: Long = 0L
+    private enum class ElevationTier(val spokenLabel: String, val elevationText: String, val rank: Int) {
+        OVERHEAD("overhead hazard", "Overhead level", 4),
+        EYE_LEVEL("eye-level hazard", "Eye level", 3),
+        KNEE("knee hazard", "Knee level", 2),
+        GROUND("ground hazard", "Ground level", 1)
+    }
+
+    private data class ZoneDetection(
+        val tier: ElevationTier,
+        val lane: Lane,
+        val isNear: Boolean,
+        val isDownwardStairs: Boolean = false,
+        val score: Float
+    )
 
     /**
-     * Evaluates a camera frame bitmap on-device according to user aim intent.
+     * Evaluates a camera snapshot completely on-device according to the user's aim intent.
      */
-    suspend fun analyzeFrame(
+    fun analyzeFrame(
         bitmap: Bitmap,
         aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
     ): HazardAssessment {
-        // 1. Ground-specific checks only apply when NOT intentionally aiming upward at ceilings/branches
+        val depthResult = depthEstimator?.estimateDepthMap(bitmap)
+        if (depthResult != null && depthResult.depthGrid.size >= depthResult.size * depthResult.size) {
+            return analyzeDepthMap(depthResult, bitmap, aimZone)
+        }
+
+        // Fallback if native LiteRT depth estimator is not attached (e.g., unsupported hardware)
+        return analyzeFallbackWithoutDepth(bitmap, aimZone)
+    }
+
+    /**
+     * Core spatial hazard analyzer operating on a normalized [0f..1f] inverse-depth grid
+     * (1.0f = closest to camera, 0.0f = farthest from camera).
+     */
+    fun analyzeDepthMap(
+        depthResult: DepthMapResult,
+        bitmap: Bitmap? = null,
+        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
+    ): HazardAssessment {
+        // Featureless / covered lens guard: flat uniform depth has near-zero dynamic range
+        if (depthResult.rawRange in 0.0001f..0.04f) {
+            return HazardAssessment.clearSafe(isOffline = true)
+        }
+
+        val grid = depthResult.depthGrid
+        val size = depthResult.size
+        val candidates = mutableListOf<ZoneDetection>()
+
+        // 1. Check Ground Plane Hazards (holes, drop-offs, downward stairs, ground protrusions)
         if (aimZone != CameraAimZone.OVERHEAD_CLEARANCE) {
-            val hasDropOffVoid = detectGroundDiscontinuity(bitmap)
-            if (hasDropOffVoid) {
+            val groundHazard = detectGroundPlaneHazard(grid, size, bitmap, aimZone)
+            if (groundHazard != null) {
+                candidates.add(groundHazard)
+            }
+        }
+
+        // 2. Check Protruding Spatial Obstacles across Overhead, Eye-Level, and Knee tiers
+        val protruding = detectProtrudingObstacles(grid, size, aimZone)
+        candidates.addAll(protruding)
+
+        if (candidates.isEmpty()) {
+            return HazardAssessment.clearSafe(isOffline = true)
+        }
+
+        // Merge Knee + Eye-Level within the same lane (tall trunk/person/wall promotes to Eye-Level)
+        val merged = mergeVerticalSpansByLane(candidates)
+
+        // Pick highest-priority hazard for ultra-concise single-sentence delivery
+        val primary = pickPrimaryHazard(merged)
+        val isUrgent = primary.isDownwardStairs ||
+            (primary.isNear && primary.lane == Lane.AHEAD) ||
+            (primary.tier == ElevationTier.GROUND && primary.isNear)
+
+        val severity = if (isUrgent) HazardSeverity.IMMINENT_DANGER else HazardSeverity.CAUTION
+        val proximityWord = if (primary.isNear) "near" else "far"
+
+        val spokenAlert = when {
+            primary.isDownwardStairs -> "STOP! Possible downward stairs, $proximityWord ${primary.lane.label}."
+            severity == HazardSeverity.IMMINENT_DANGER -> "STOP! Possible ${primary.tier.spokenLabel}, $proximityWord ${primary.lane.label}."
+            else -> "Possible ${primary.tier.spokenLabel}, $proximityWord ${primary.lane.label}."
+        }
+
+        val obstacles = merged.map { det ->
+            DetectedObstacle(
+                name = if (det.isDownwardStairs) "Possible downward stairs" else "Possible ${det.tier.spokenLabel}",
+                direction = if (det.lane == Lane.AHEAD) "straight ahead" else det.lane.label,
+                proximity = if (det.isNear) "near ahead" else "far ahead",
+                elevation = det.tier.elevationText,
+                approxDistanceScore = if (det.isNear) 1.0 else 2.8
+            )
+        }
+
+        return HazardAssessment(
+            severity = severity,
+            spokenAlert = spokenAlert,
+            detailedSummary = spokenAlert,
+            obstacles = obstacles,
+            hasStairsDown = primary.isDownwardStairs,
+            hasDropOff = primary.tier == ElevationTier.GROUND && primary.isNear && !primary.isDownwardStairs,
+            hasPotholeOrVoid = primary.tier == ElevationTier.GROUND && !primary.isDownwardStairs,
+            hasHeadOverhang = primary.tier == ElevationTier.OVERHEAD,
+            isOfflineEngine = true
+        )
+    }
+
+    private fun detectGroundPlaneHazard(
+        grid: FloatArray,
+        size: Int,
+        bitmap: Bitmap?,
+        aimZone: CameraAimZone
+    ): ZoneDetection? {
+        val scanTopY = if (aimZone == CameraAimZone.GROUND_NEAR) 96 else 186
+        val scanBottomY = 236
+        val midSplitY = if (aimZone == CameraAimZone.GROUND_NEAR) 172 else 206
+
+        // A. Downward Drop-Off / Stairwell Cliff Check along center walking lane
+        val nearFootDepth = regionMean(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 212, 238)
+        val midGroundDepth = regionMean(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 166, 200)
+        val forwardDrop = nearFootDepth - midGroundDepth
+
+        val hasStepTexture = bitmap != null && detectParallelStepLines(bitmap)
+        if (forwardDrop > 0.32f && nearFootDepth > 0.58f) {
+            val isStairs = hasStepTexture && isStairsDescending(bitmap!!)
+            return ZoneDetection(
+                tier = ElevationTier.GROUND,
+                lane = Lane.AHEAD,
+                isNear = true,
+                isDownwardStairs = isStairs,
+                score = forwardDrop + 0.5f
+            )
+        }
+
+        // B. Localized Ground Hole / Pothole Cavity Check (depth recess relative to floor median baseline)
+        var recessedTotal = 0
+        var recessedNear = 0
+        var totalSamples = 0
+        var maxRecessDelta = 0f
+
+        for (y in scanTopY until scanBottomY step 3) {
+            // Estimate pavement rim depth using median across the row so narrow obstacles do not inflate baseline
+            val rowRimDepth = rowPercentile(grid, size, 24, 232, y, 0.55f)
+            if (rowRimDepth < 0.35f || rowRimDepth > nearFootDepth + 0.08f) continue
+
+            for (x in Lane.AHEAD.xStart until Lane.AHEAD.xEnd step 3) {
+                val d = grid[y * size + x]
+                val delta = rowRimDepth - d
+                totalSamples++
+                if (delta > 0.21f) {
+                    recessedTotal++
+                    if (y >= midSplitY) recessedNear++
+                    if (delta > maxRecessDelta) maxRecessDelta = delta
+                }
+            }
+        }
+
+        if (totalSamples >= 20) {
+            val recessRatio = recessedTotal.toFloat() / totalSamples
+            if (recessRatio in 0.045f..0.45f && maxRecessDelta > 0.23f) {
+                val isNear = aimZone == CameraAimZone.GROUND_NEAR || recessedNear >= (recessedTotal / 2)
+                return ZoneDetection(
+                    tier = ElevationTier.GROUND,
+                    lane = Lane.AHEAD,
+                    isNear = isNear,
+                    isDownwardStairs = false,
+                    score = maxRecessDelta + recessRatio
+                )
+            }
+        }
+
+        // C. High-confidence step pattern with downward drop in pixel gradient when depth drop is mild
+        if (hasStepTexture && bitmap != null && isStairsDescending(bitmap) && forwardDrop > 0.18f) {
+            return ZoneDetection(
+                tier = ElevationTier.GROUND,
+                lane = Lane.AHEAD,
+                isNear = true,
+                isDownwardStairs = true,
+                score = 0.65f
+            )
+        }
+
+        // D. Protruding low ground obstacle dead ahead (curb block / debris sticking above surrounding floor)
+        val aheadGroundP80 = regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 188, 234, 0.80f)
+        val leftGroundMed = regionPercentile(grid, size, Lane.LEFT.xStart, Lane.LEFT.xEnd, 188, 234, 0.50f)
+        val rightGroundMed = regionPercentile(grid, size, Lane.RIGHT.xStart, Lane.RIGHT.xEnd, 188, 234, 0.50f)
+        val sideFloorBaseline = (leftGroundMed + rightGroundMed) * 0.5f
+        if (aheadGroundP80 - sideFloorBaseline > 0.22f && aheadGroundP80 > 0.72f) {
+            return ZoneDetection(
+                tier = ElevationTier.GROUND,
+                lane = Lane.AHEAD,
+                isNear = true,
+                score = aheadGroundP80 - sideFloorBaseline
+            )
+        }
+
+        return null
+    }
+
+    private fun detectProtrudingObstacles(
+        grid: FloatArray,
+        size: Int,
+        aimZone: CameraAimZone
+    ): List<ZoneDetection> {
+        val found = mutableListOf<ZoneDetection>()
+
+        // Baseline background depths per band to distinguish real protruding mass from far horizon
+        val overheadBg = regionPercentile(grid, size, 16, 240, 12, 66, 0.40f)
+        val eyeBg = regionPercentile(grid, size, 16, 240, 66, 136, 0.40f)
+
+        for (lane in Lane.entries) {
+            if (aimZone == CameraAimZone.OVERHEAD_CLEARANCE) {
+                // When user aims upward, evaluate upper & center bands strictly as Overhead clearance
+                val cellP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 36, 168, 0.80f)
+                val nearCoverage = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 36, 168, 0.62f)
+                if (nearCoverage >= 0.16f && cellP80 > 0.64f) {
+                    found.add(ZoneDetection(ElevationTier.OVERHEAD, lane, isNear = true, score = cellP80))
+                } else if (cellP80 > 0.50f && regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 36, 168, 0.48f) >= 0.22f) {
+                    found.add(ZoneDetection(ElevationTier.OVERHEAD, lane, isNear = false, score = cellP80))
+                }
+                continue
+            }
+
+            // 1. Overhead band (top ~25%)
+            val ohNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 12, 66, 0.64f)
+            val ohP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 12, 66, 0.80f)
+            if (ohNearFrac >= 0.16f && ohP80 - overheadBg > 0.20f) {
+                found.add(ZoneDetection(ElevationTier.OVERHEAD, lane, isNear = true, score = ohP80))
+            }
+
+            // 2. Eye-Level band (middle-upper horizon)
+            val eyeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.66f)
+            val eyeFarFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.50f)
+            val eyeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 66, 136, 0.80f)
+            if (eyeNearFrac >= 0.18f && eyeP80 > 0.68f) {
+                found.add(ZoneDetection(ElevationTier.EYE_LEVEL, lane, isNear = true, score = eyeP80))
+            } else if (eyeFarFrac >= 0.22f && eyeP80 - eyeBg > 0.20f && eyeP80 > 0.52f) {
+                found.add(ZoneDetection(ElevationTier.EYE_LEVEL, lane, isNear = false, score = eyeP80))
+            }
+
+            // 3. Knee-Level band (must clearly protrude closer than adjacent floor baseline)
+            if (aimZone == CameraAimZone.FORWARD_PATH) {
+                val kneeP80 = regionPercentile(grid, size, lane.xStart, lane.xEnd, 136, 186, 0.80f)
+                val otherLaneMed = when (lane) {
+                    Lane.AHEAD -> (regionPercentile(grid, size, Lane.LEFT.xStart, Lane.LEFT.xEnd, 136, 186, 0.50f) +
+                        regionPercentile(grid, size, Lane.RIGHT.xStart, Lane.RIGHT.xEnd, 136, 186, 0.50f)) * 0.5f
+                    Lane.LEFT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 136, 186, 0.50f)
+                    Lane.RIGHT -> regionPercentile(grid, size, Lane.AHEAD.xStart, Lane.AHEAD.xEnd, 136, 186, 0.50f)
+                }
+                val kneeNearFrac = regionFractionAbove(grid, size, lane.xStart, lane.xEnd, 136, 186, 0.72f)
+                if (kneeNearFrac >= 0.20f && kneeP80 - otherLaneMed > 0.17f) {
+                    found.add(ZoneDetection(ElevationTier.KNEE, lane, isNear = true, score = kneeP80))
+                }
+            }
+        }
+
+        return found
+    }
+
+    private fun mergeVerticalSpansByLane(detections: List<ZoneDetection>): List<ZoneDetection> {
+        val byLane = detections.groupBy { it.lane }
+        val result = mutableListOf<ZoneDetection>()
+
+        for ((_, laneItems) in byLane) {
+            val hasEye = laneItems.firstOrNull { it.tier == ElevationTier.EYE_LEVEL }
+            val hasKnee = laneItems.firstOrNull { it.tier == ElevationTier.KNEE }
+
+            for (item in laneItems) {
+                if (item == hasKnee && hasEye != null) {
+                    // Skip lower knee alert when eye-level already blocks the same lane
+                    continue
+                }
+                result.add(item)
+            }
+        }
+        return result
+    }
+
+    private fun pickPrimaryHazard(detections: List<ZoneDetection>): ZoneDetection {
+        return detections.maxWithOrNull(
+            compareBy<ZoneDetection>(
+                { it.isDownwardStairs },
+                { it.lane == Lane.AHEAD && it.isNear },
+                { it.isNear },
+                { it.lane == Lane.AHEAD },
+                { it.tier.rank },
+                { it.score }
+            )
+        ) ?: detections.first()
+    }
+
+    /**
+     * Minimal fallback when depth model is unavailable: checks high-confidence floor discontinuity
+     * or descending step texture without guessing object nouns.
+     */
+    private fun analyzeFallbackWithoutDepth(bitmap: Bitmap, aimZone: CameraAimZone): HazardAssessment {
+        if (aimZone != CameraAimZone.OVERHEAD_CLEARANCE) {
+            if (detectGroundDiscontinuity(bitmap)) {
                 return HazardAssessment(
                     severity = HazardSeverity.IMMINENT_DANGER,
-                    spokenAlert = "STOP! Possible drop-off near straight ahead.",
-                    detailedSummary = "Sudden ground discontinuity or dark drop detected straight ahead.",
+                    spokenAlert = "STOP! Possible ground hazard, near ahead.",
+                    detailedSummary = "Ground discontinuity detected near ahead.",
                     hasDropOff = true,
                     isOfflineEngine = true
                 )
             }
-
-            val potholeResult = evaluatePotholeOrGroundCavity(bitmap, aimZone)
-            if (potholeResult.detected) {
-                val proximityLabel = if (aimZone == CameraAimZone.GROUND_NEAR || potholeResult.isNearBottom) {
-                    "near ahead"
-                } else {
-                    "far ahead"
-                }
-                val isUrgent = proximityLabel == "near ahead"
+            if (detectParallelStepLines(bitmap) && isStairsDescending(bitmap)) {
                 return HazardAssessment(
-                    severity = if (isUrgent) HazardSeverity.IMMINENT_DANGER else HazardSeverity.CAUTION,
-                    spokenAlert = if (isUrgent) {
-                        "STOP! Possible pothole near straight ahead."
-                    } else {
-                        "Caution: Possible pothole far straight ahead."
-                    },
-                    detailedSummary = "Localized ground depression or dark cavity detected ($proximityLabel).",
-                    hasPotholeOrVoid = true,
+                    severity = HazardSeverity.IMMINENT_DANGER,
+                    spokenAlert = "STOP! Possible downward stairs, near ahead.",
+                    detailedSummary = "Possible descending step edges detected near ahead.",
+                    hasStairsDown = true,
                     isOfflineEngine = true
                 )
             }
-
-            val hasStairsPattern = detectParallelStepLines(bitmap)
-            if (hasStairsPattern) {
-                val isDescending = isStairsDescending(bitmap)
-                return if (isDescending) {
-                    HazardAssessment(
-                        severity = HazardSeverity.IMMINENT_DANGER,
-                        spokenAlert = "STOP! Possible stairs going down near straight ahead.",
-                        detailedSummary = "Possible descending staircase detected ahead.",
-                        hasStairsDown = true,
-                        isOfflineEngine = true
-                    )
-                } else {
-                    HazardAssessment(
-                        severity = HazardSeverity.CAUTION,
-                        spokenAlert = "Caution: Possible steps going up straight ahead.",
-                        detailedSummary = "Possible ascending steps detected ahead.",
-                        hasStairsUp = true,
-                        isOfflineEngine = true
-                    )
-                }
-            }
         }
-
-        // 2. Local ML Kit Object Detection (with tightened dead-ahead center corridor sensitivity)
-        val mlKitObstacles = detectMlKitObjects(bitmap, aimZone)
-        if (mlKitObstacles.isNotEmpty()) {
-            val closest = mlKitObstacles.minByOrNull { it.approxDistanceScore } ?: mlKitObstacles.first()
-
-            val isImminent = closest.proximity == "near ahead" && closest.direction == "straight ahead"
-            val severity = if (isImminent && aimZone != CameraAimZone.OVERHEAD_CLEARANCE) {
-                HazardSeverity.IMMINENT_DANGER
-            } else {
-                HazardSeverity.CAUTION
-            }
-
-            // Check if closest target is actively approaching across consecutive scans
-            val now = System.currentTimeMillis()
-            val timeDelta = now - lastScanTimeMs
-            val currentDistanceMetric = (1.0f / (closest.approxDistanceScore.toFloat() + 0.1f))
-            val isApproaching = lastScanTimeMs > 0L &&
-                    timeDelta in 300L..6000L &&
-                    lastObjectName == closest.name &&
-                    currentDistanceMetric > lastObjectDistanceMetric * 1.22f
-
-            lastObjectDistanceMetric = currentDistanceMetric
-            lastObjectName = closest.name
-            lastScanTimeMs = now
-
-            val finalObstacles = mlKitObstacles.map {
-                if (it == closest && isApproaching) it.copy(isApproaching = true) else it
-            }
-
-            val objectLabel = closest.name.lowercase()
-            val alertText = when {
-                aimZone == CameraAimZone.OVERHEAD_CLEARANCE -> {
-                    "Caution: Possible overhead obstacle ${closest.proximity} ${closest.direction}."
-                }
-                isApproaching && closest.name == "Person" -> {
-                    if (severity == HazardSeverity.IMMINENT_DANGER) {
-                        "STOP! Possible person approaching near straight ahead."
-                    } else {
-                        "Caution: Possible person approaching ${closest.proximity} ${closest.direction}."
-                    }
-                }
-                isApproaching && closest.name == "Animal" -> {
-                    "Caution: Possible animal moving toward path ${closest.direction}."
-                }
-                isApproaching -> {
-                    "Caution: Possible $objectLabel approaching ${closest.direction}."
-                }
-                severity == HazardSeverity.IMMINENT_DANGER -> {
-                    "STOP! Possible $objectLabel ${closest.proximity} ${closest.direction}."
-                }
-                else -> {
-                    "Caution: Possible $objectLabel ${closest.proximity} ${closest.direction}."
-                }
-            }
-
-            return HazardAssessment(
-                severity = severity,
-                spokenAlert = alertText,
-                detailedSummary = "On-device scan noted ${mlKitObstacles.size} possible item(s) in view.",
-                obstacles = finalObstacles,
-                hasHeadOverhang = aimZone == CameraAimZone.OVERHEAD_CLEARANCE,
-                isOfflineEngine = true
-            )
-        }
-
-        // Under Quiet-by-Default: Clear aimed view emits no speech
         return HazardAssessment.clearSafe(isOffline = true)
     }
 
@@ -194,7 +370,6 @@ class OnDeviceSafetyEngine {
             horizontalGradientEnergies.add(if (count > 0) rowGradSum / count else 0.0)
         }
 
-        // Count periodic sharp edge peaks
         var peakCount = 0
         for (i in 2 until horizontalGradientEnergies.size - 2) {
             val curr = horizontalGradientEnergies[i]
@@ -209,7 +384,7 @@ class OnDeviceSafetyEngine {
     }
 
     /**
-     * Detects ground drop-off discontinuity in lower walking sector.
+     * Detects severe ground drop-off discontinuity in lower walking sector.
      */
     fun detectGroundDiscontinuity(bitmap: Bitmap): Boolean {
         val width = bitmap.width
@@ -234,148 +409,8 @@ class OnDeviceSafetyEngine {
         return (avgFoot > 40 && avgGround < 12)
     }
 
-    private suspend fun detectMlKitObjects(
-        bitmap: Bitmap,
-        aimZone: CameraAimZone
-    ): List<DetectedObstacle> {
-        return suspendCancellableCoroutine { continuation ->
-            val inputImage = InputImage.fromBitmap(bitmap, 0)
-            objectDetector.process(inputImage)
-                .addOnSuccessListener { detectedObjects ->
-                    val obstacles = mutableListOf<DetectedObstacle>()
-                    val width = bitmap.width.toFloat()
-                    val height = bitmap.height.toFloat()
-
-                    for (obj in detectedObjects) {
-                        val box = obj.boundingBox
-                        val centerX = box.centerX().toFloat()
-                        val boxAreaPercent = (box.width() * box.height()) / (width * height)
-
-                        val direction = when {
-                            centerX < width * 0.36f -> "slightly left"
-                            centerX > width * 0.64f -> "slightly right"
-                            else -> "straight ahead"
-                        }
-
-                        // Dead-ahead center corridor allows smaller foreshortened obstacles (1.5%+)
-                        val minAreaThreshold = if (direction == "straight ahead") 0.015f else 0.035f
-                        if (boxAreaPercent > minAreaThreshold) {
-                            val isNear = aimZone == CameraAimZone.GROUND_NEAR ||
-                                boxAreaPercent > 0.14f ||
-                                box.bottom > height * 0.78f
-                            val proximity = if (isNear) "near ahead" else "far ahead"
-                            val distanceScore = when {
-                                boxAreaPercent > 0.25f -> 0.8
-                                isNear -> 1.4
-                                else -> 2.8
-                            }
-
-                            val boxWidth = box.width().toFloat()
-                            val boxHeight = box.height().toFloat()
-                            val aspectRatio = boxHeight / boxWidth.coerceAtLeast(1f)
-
-                            val rawLabel = obj.labels.firstOrNull()?.text?.lowercase().orEmpty()
-                            val detectedType = when {
-                                rawLabel.contains("person") || rawLabel.contains("human") -> "Person"
-                                rawLabel.contains("dog") || rawLabel.contains("cat") || rawLabel.contains("animal") -> "Animal"
-                                rawLabel.contains("car") || rawLabel.contains("vehicle") -> "Vehicle"
-                                aspectRatio >= 1.6f && box.bottom > height * 0.5f -> "Person"
-                                aspectRatio in 0.5f..1.3f && box.bottom > height * 0.65f && boxAreaPercent in 0.03f..0.35f -> "Animal"
-                                else -> obj.labels.firstOrNull()?.text ?: "Obstacle"
-                            }
-
-                            val elevation = when {
-                                aimZone == CameraAimZone.OVERHEAD_CLEARANCE -> "Head/Overhead level"
-                                box.bottom > height * 0.7f -> "Ground level"
-                                else -> "Knee level"
-                            }
-
-                            obstacles.add(
-                                DetectedObstacle(
-                                    name = detectedType,
-                                    direction = direction,
-                                    proximity = proximity,
-                                    elevation = elevation,
-                                    approxDistanceScore = distanceScore
-                                )
-                            )
-                        }
-                    }
-                    continuation.resume(obstacles)
-                }
-                .addOnFailureListener { e ->
-                    Log.w(TAG, "ML Kit object detection failed", e)
-                    continuation.resume(emptyList())
-                }
-        }
-    }
-
-    data class PotholeScanResult(val detected: Boolean, val isNearBottom: Boolean)
-
     /**
-     * Detects potholes, open holes, or sunken pavement depressions in the forward walking corridor.
-     */
-    fun detectPotholeOrGroundCavity(
-        bitmap: Bitmap,
-        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
-    ): Boolean {
-        return evaluatePotholeOrGroundCavity(bitmap, aimZone).detected
-    }
-
-    fun evaluatePotholeOrGroundCavity(
-        bitmap: Bitmap,
-        aimZone: CameraAimZone = CameraAimZone.FORWARD_PATH
-    ): PotholeScanResult {
-        if (aimZone == CameraAimZone.OVERHEAD_CLEARANCE) return PotholeScanResult(false, false)
-
-        val width = bitmap.width
-        val height = bitmap.height
-        val startY = if (aimZone == CameraAimZone.GROUND_NEAR) (height * 0.25).toInt() else (height * 0.50).toInt()
-        val endY = (height * 0.94).toInt()
-        val midSplitY = (height * 0.74).toInt()
-        val startX = (width * 0.28).toInt()
-        val endX = (width * 0.72).toInt()
-        val step = (width / 25).coerceAtLeast(4)
-
-        var totalLum = 0.0
-        var totalSamples = 0
-        val cellLuminance = mutableListOf<Double>()
-        val cellY = mutableListOf<Int>()
-
-        for (y in startY until endY step step) {
-            for (x in startX until endX step step) {
-                val lum = getLuminance(bitmap.getPixel(x, y)).toDouble()
-                totalLum += lum
-                totalSamples++
-                cellLuminance.add(lum)
-                cellY.add(y)
-            }
-        }
-
-        if (totalSamples < 12) return PotholeScanResult(false, false)
-        val avgPavementLum = totalLum / totalSamples
-        if (avgPavementLum < 30.0) return PotholeScanResult(false, false)
-
-        var darkCount = 0
-        var nearDarkCount = 0
-        for (i in cellLuminance.indices) {
-            if (cellLuminance[i] < avgPavementLum * 0.45) {
-                darkCount++
-                if (cellY[i] >= midSplitY) {
-                    nearDarkCount++
-                }
-            }
-        }
-
-        val depressionRatio = darkCount.toDouble() / totalSamples
-        // Lower min ratio to 0.035 to catch foreshortened potholes dead ahead
-        val detected = depressionRatio in 0.035..0.38
-        val isNearBottom = darkCount > 0 && nearDarkCount >= (darkCount / 2)
-        return PotholeScanResult(detected = detected, isNearBottom = isNearBottom)
-    }
-
-    /**
-     * Distinguishes descending stairs (downward drop) from ascending stairs (upward steps).
+     * Distinguishes descending stairs (downward drop) from ascending stairs.
      */
     fun isStairsDescending(bitmap: Bitmap): Boolean {
         val width = bitmap.width
@@ -398,6 +433,84 @@ class OnDeviceSafetyEngine {
         val avgLower = lowerLum / count
 
         return avgMid < avgLower * 0.75 || avgMid < 30.0
+    }
+
+    private fun regionMean(grid: FloatArray, size: Int, x0: Int, x1: Int, y0: Int, y1: Int): Float {
+        var sum = 0f
+        var count = 0
+        for (y in y0 until y1 step 3) {
+            val rowOffset = y * size
+            for (x in x0 until x1 step 3) {
+                sum += grid[rowOffset + x]
+                count++
+            }
+        }
+        return if (count > 0) sum / count else 0f
+    }
+
+    private fun regionFractionAbove(
+        grid: FloatArray,
+        size: Int,
+        x0: Int,
+        x1: Int,
+        y0: Int,
+        y1: Int,
+        threshold: Float
+    ): Float {
+        var above = 0
+        var total = 0
+        for (y in y0 until y1 step 3) {
+            val rowOffset = y * size
+            for (x in x0 until x1 step 3) {
+                total++
+                if (grid[rowOffset + x] > threshold) above++
+            }
+        }
+        return if (total > 0) above.toFloat() / total else 0f
+    }
+
+    private fun regionPercentile(
+        grid: FloatArray,
+        size: Int,
+        x0: Int,
+        x1: Int,
+        y0: Int,
+        y1: Int,
+        percentile: Float
+    ): Float {
+        val samples = mutableListOf<Float>()
+        for (y in y0 until y1 step 4) {
+            val rowOffset = y * size
+            for (x in x0 until x1 step 4) {
+                samples.add(grid[rowOffset + x])
+            }
+        }
+        if (samples.isEmpty()) return 0f
+        samples.sort()
+        val idx = (samples.size * percentile).toInt().coerceIn(0, samples.lastIndex)
+        return samples[idx]
+    }
+
+    private fun rowPercentile(
+        grid: FloatArray,
+        size: Int,
+        x0: Int,
+        x1: Int,
+        y: Int,
+        percentile: Float
+    ): Float {
+        val rowOffset = y * size
+        val samples = FloatArray(((x1 - x0) + 3) / 4)
+        var count = 0
+        var x = x0
+        while (x < x1 && count < samples.size) {
+            samples[count++] = grid[rowOffset + x]
+            x += 4
+        }
+        if (count == 0) return 0f
+        samples.sort(0, count)
+        val idx = (count * percentile).toInt().coerceIn(0, count - 1)
+        return samples[idx]
     }
 
     private fun getLuminance(pixel: Int): Int {

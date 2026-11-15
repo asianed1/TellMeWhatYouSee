@@ -5,17 +5,17 @@ import android.graphics.Bitmap
 import android.util.Log
 import androidx.lifecycle.AndroidViewModel
 import androidx.lifecycle.viewModelScope
-import com.example.ai.GeminiVisionHazardService
 import com.example.feedback.AudioHapticFeedbackController
 import com.example.model.DetectedObstacle
 import com.example.model.HazardAssessment
 import com.example.model.HazardSeverity
 import com.example.model.OperatingMode
 import com.example.model.SensorTelemetry
-import com.example.network.NetworkMonitor
+import com.example.safety.MiDaSDepthEstimator
 import com.example.safety.OnDeviceSafetyEngine
 import com.example.sensor.DeviceSensorAnalyzer
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
@@ -23,6 +23,7 @@ import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.collectLatest
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 private const val TAG = "VisionViewModel"
 
@@ -32,7 +33,7 @@ data class AssistantUiState(
     val lastAlertText: String = "Ready. Tap screen or press Volume Up/Down to scan.",
     val operatingMode: OperatingMode = OperatingMode.ON_DEMAND,
     val isTorchActive: Boolean = false,
-    val isOnline: Boolean = true,
+    val isDepthModelReady: Boolean = false,
     val telemetry: SensorTelemetry = SensorTelemetry(),
     val assessmentHistory: List<HazardAssessment> = emptyList(),
     val errorMessage: String? = null
@@ -50,9 +51,8 @@ class VisionAssistantViewModel(
 
     private val feedbackController = AudioHapticFeedbackController(application)
     private val sensorAnalyzer = DeviceSensorAnalyzer(application)
-    private val networkMonitor = NetworkMonitor(application)
-    private val onDeviceSafetyEngine = OnDeviceSafetyEngine()
-    private val geminiService = GeminiVisionHazardService()
+    private val depthEstimator = MiDaSDepthEstimator(application)
+    private val onDeviceSafetyEngine = OnDeviceSafetyEngine(depthEstimator)
 
     private val _uiState = MutableStateFlow(AssistantUiState())
     val uiState: StateFlow<AssistantUiState> = _uiState.asStateFlow()
@@ -65,26 +65,16 @@ class VisionAssistantViewModel(
     init {
         sensorAnalyzer.startListening()
 
+        // Warm up on-device MiDaS depth model in background for fast first scan
+        viewModelScope.launch(Dispatchers.Default) {
+            val ready = depthEstimator.warmUp()
+            _uiState.value = _uiState.value.copy(isDepthModelReady = ready)
+        }
+
         // Sync sensor telemetry
         viewModelScope.launch {
             sensorAnalyzer.telemetry.collectLatest { tel ->
                 _uiState.value = _uiState.value.copy(telemetry = tel)
-            }
-        }
-
-        // Sync online status and notify user when status changes
-        viewModelScope.launch {
-            networkMonitor.isOnline.collectLatest { online ->
-                val prev = _uiState.value.isOnline
-                _uiState.value = _uiState.value.copy(isOnline = online)
-                if (prev != online) {
-                    if (!online) {
-                        feedbackController.speakInformative("Offline mode. Local safety core active.")
-                    } else {
-                        feedbackController.playCautionChime()
-                        feedbackController.speakInformative("Online. Cloud AI restored.")
-                    }
-                }
             }
         }
     }
@@ -154,18 +144,8 @@ class VisionAssistantViewModel(
             }
 
             try {
-                val isOnline = _uiState.value.isOnline
                 val aimZone = _uiState.value.telemetry.aimZone
-                val assessment = if (isOnline) {
-                    try {
-                        geminiService.analyzeFrame(targetBitmap, aimZone)
-                    } catch (e: CancellationException) {
-                        throw e
-                    } catch (e: Exception) {
-                        Log.w(TAG, "Cloud AI failed, falling back to local safety engine", e)
-                        onDeviceSafetyEngine.analyzeFrame(targetBitmap, aimZone)
-                    }
-                } else {
+                val assessment = withContext(Dispatchers.Default) {
                     onDeviceSafetyEngine.analyzeFrame(targetBitmap, aimZone)
                 }
 
@@ -320,7 +300,7 @@ class VisionAssistantViewModel(
             hasStairsUp = hasStairsUp,
             hasDropOff = hasDropOff,
             hasPotholeOrVoid = hasPothole,
-            isOfflineEngine = !_uiState.value.isOnline
+            isOfflineEngine = true
         )
         feedbackController.dispatchAssessment(assessment)
         val newHistory = (listOf(assessment) + _uiState.value.assessmentHistory).take(15)
@@ -335,6 +315,7 @@ class VisionAssistantViewModel(
         super.onCleared()
         continuousScanJob?.cancel()
         sensorAnalyzer.stopListening()
+        depthEstimator.close()
         feedbackController.release()
     }
 }

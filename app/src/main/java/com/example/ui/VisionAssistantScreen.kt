@@ -35,10 +35,9 @@ import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
-import androidx.compose.material.icons.filled.Cloud
-import androidx.compose.material.icons.filled.CloudOff
 import androidx.compose.material.icons.filled.FlashOff
 import androidx.compose.material.icons.filled.FlashOn
+import androidx.compose.material.icons.filled.Memory
 import androidx.compose.material.icons.filled.PlayArrow
 import androidx.compose.material.icons.filled.Refresh
 import androidx.compose.material.icons.filled.Stop
@@ -199,7 +198,7 @@ fun VisionAssistantScreen(
         ) {
             // TOP STATUS BAR
             TopAccessibilityBar(
-                isOnline = uiState.isOnline,
+                isDepthModelReady = uiState.isDepthModelReady,
                 operatingMode = uiState.operatingMode,
                 isTorchOn = uiState.isTorchActive,
                 angleGuidance = uiState.telemetry.angleGuidanceText,
@@ -214,7 +213,7 @@ fun VisionAssistantScreen(
                 severity = currentSeverity,
                 alertText = uiState.lastAlertText,
                 isAnalyzing = uiState.isAnalyzing,
-                isOffline = !uiState.isOnline,
+                isOffline = true,
                 hasStairsDown = uiState.currentAssessment?.hasStairsDown == true,
                 hasStairsUp = uiState.currentAssessment?.hasStairsUp == true,
                 hasDropOff = uiState.currentAssessment?.hasDropOff == true,
@@ -243,7 +242,7 @@ fun VisionAssistantScreen(
 
 @Composable
 fun TopAccessibilityBar(
-    isOnline: Boolean,
+    isDepthModelReady: Boolean,
     operatingMode: OperatingMode,
     isTorchOn: Boolean,
     angleGuidance: String,
@@ -263,25 +262,29 @@ fun TopAccessibilityBar(
                 horizontalArrangement = Arrangement.SpaceBetween,
                 verticalAlignment = Alignment.CenterVertically
             ) {
-                // Online/Offline Status Indicator
+                // Self-Contained Depth Engine Indicator
                 Row(
                     verticalAlignment = Alignment.CenterVertically,
                     modifier = Modifier.semantics {
-                        contentDescription = if (isOnline) "Connected to Cloud Gemini Vision" else "Offline. Local Safety Core active."
+                        contentDescription = if (isDepthModelReady) {
+                            "On-device depth engine ready. Works completely offline."
+                        } else {
+                            "Local safety core initializing."
+                        }
                     }
                 ) {
                     Icon(
-                        imageVector = if (isOnline) Icons.Default.Cloud else Icons.Default.CloudOff,
+                        imageVector = Icons.Default.Memory,
                         contentDescription = null,
-                        tint = if (isOnline) SafeGreen else CautionAmber,
+                        tint = if (isDepthModelReady) SafeGreen else CautionAmber,
                         modifier = Modifier.size(22.dp)
                     )
                     Spacer(modifier = Modifier.width(6.dp))
                     Text(
-                        text = if (isOnline) "Cloud AI" else "Local Core",
+                        text = if (isDepthModelReady) "Depth Core" else "Safety Core",
                         fontSize = 13.sp,
                         fontWeight = FontWeight.Bold,
-                        color = if (isOnline) SafeGreen else CautionAmber
+                        color = if (isDepthModelReady) SafeGreen else CautionAmber
                     )
                 }
 
@@ -413,7 +416,7 @@ fun CenterHazardHero(
                 )
                 Spacer(modifier = Modifier.height(16.dp))
                 Text(
-                    text = if (isOffline) "Local Safety Core Scanning..." else "Gemini Analyzing Path...",
+                    text = "Scanning Depth & Hazards...",
                     fontSize = 20.sp,
                     fontWeight = FontWeight.Bold,
                     color = contentColor
@@ -619,13 +622,13 @@ fun BottomAssistancePanel(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        // Scenario 1: Descending Stairs
+                        // Scenario 1: Downward Stairs
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Possible concrete staircase going down",
-                                    "STOP! Possible stairs going down near straight ahead.",
+                                    "STOP! Possible downward stairs, near ahead.",
+                                    "STOP! Possible downward stairs, near ahead.",
                                     true,
                                     false,
                                     false,
@@ -641,13 +644,13 @@ fun BottomAssistancePanel(
                             Text("Stairs Down", fontSize = 10.sp, color = Color.White)
                         }
 
-                        // Scenario 2: Ground Pothole
+                        // Scenario 2: Ground Hazard / Hole
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Possible pothole cavity in pavement",
-                                    "STOP! Possible pothole near straight ahead.",
+                                    "STOP! Possible ground hazard, near ahead.",
+                                    "STOP! Possible ground hazard, near ahead.",
                                     false,
                                     false,
                                     false,
@@ -660,19 +663,19 @@ fun BottomAssistancePanel(
                                 .weight(1f)
                                 .testTag("sim_pothole_button")
                         ) {
-                            Text("Pothole", fontSize = 10.sp, color = Color.White)
+                            Text("Ground", fontSize = 10.sp, color = Color.White)
                         }
 
-                        // Scenario 3: Drop-Off Void
+                        // Scenario 3: Eye-Level Hazard
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Possible platform edge or drop-off",
-                                    "STOP! Possible drop-off near straight ahead.",
+                                    "STOP! Possible eye-level hazard, near ahead.",
+                                    "STOP! Possible eye-level hazard, near ahead.",
                                     false,
                                     false,
-                                    true,
+                                    false,
                                     false
                                 )
                             },
@@ -682,26 +685,26 @@ fun BottomAssistancePanel(
                                 .weight(1f)
                                 .testTag("sim_dropoff_button")
                         ) {
-                            Text("Drop-Off", fontSize = 10.sp, color = Color.White)
+                            Text("Eye-Level", fontSize = 10.sp, color = Color.White)
                         }
                     }
 
                     Spacer(modifier = Modifier.height(6.dp))
 
-                    // Row 2: Ascending Stairs, Static Obstacles, Clear Path
+                    // Row 2: Knee, Overhead, Clear Path
                     Row(
                         modifier = Modifier.fillMaxWidth(),
                         horizontalArrangement = Arrangement.spacedBy(6.dp)
                     ) {
-                        // Scenario 4: Ascending Stairs (Navigable elevation)
+                        // Scenario 4: Knee Hazard
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.CAUTION,
-                                    "Possible steps leading upward",
-                                    "Caution: Possible steps going up near straight ahead.",
+                                    "Possible knee hazard, near slightly left.",
+                                    "Possible knee hazard, near slightly left.",
                                     false,
-                                    true,
+                                    false,
                                     false,
                                     false
                                 )
@@ -712,16 +715,16 @@ fun BottomAssistancePanel(
                                 .weight(1f)
                                 .testTag("sim_stairs_up_button")
                         ) {
-                            Text("Stairs Up", fontSize = 10.sp, color = Color.Black)
+                            Text("Knee", fontSize = 10.sp, color = Color.Black)
                         }
 
-                        // Scenario 5: Obstacle slightly right
+                        // Scenario 5: Overhead Hazard
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.CAUTION,
-                                    "Possible obstacle slightly right",
-                                    "Caution: Possible obstacle far slightly right.",
+                                    "Possible overhead hazard, near ahead.",
+                                    "Possible overhead hazard, near ahead.",
                                     false,
                                     false,
                                     false,
