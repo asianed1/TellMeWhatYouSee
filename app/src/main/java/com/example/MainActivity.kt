@@ -1,6 +1,7 @@
 package com.example
 
 import android.os.Bundle
+import android.view.KeyEvent
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.activity.enableEdgeToEdge
@@ -36,6 +37,20 @@ class MainActivity : ComponentActivity() {
                     VisionAssistantScreen(viewModel = viewModel)
                 }
             }
+        }
+    }
+
+    override fun onKeyDown(keyCode: Int, event: KeyEvent?): Boolean {
+        return when (keyCode) {
+            KeyEvent.KEYCODE_VOLUME_UP,
+            KeyEvent.KEYCODE_VOLUME_DOWN,
+            KeyEvent.KEYCODE_CAMERA -> {
+                if (event?.repeatCount == 0) {
+                    viewModel.onUserTriggerScan()
+                }
+                true
+            }
+            else -> super.onKeyDown(keyCode, event)
         }
     }
 }

@@ -1,8 +1,13 @@
 package com.example
 
+import android.content.Context
 import android.graphics.Bitmap
 import android.graphics.Color
+import androidx.test.core.app.ApplicationProvider
+import com.example.model.CameraAimZone
 import com.example.safety.OnDeviceSafetyEngine
+import com.example.sensor.DeviceSensorAnalyzer
+import org.junit.Assert.assertEquals
 import org.junit.Assert.assertFalse
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -18,7 +23,6 @@ class OnDeviceSafetyEngineTest {
 
     @Test
     fun `uniform surface does not trigger stairs or dropoff`() {
-        // 200x200 uniform grey pavement
         val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.GRAY)
 
@@ -34,7 +38,6 @@ class OnDeviceSafetyEngineTest {
         val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
         bitmap.eraseColor(Color.LTGRAY)
 
-        // Draw distinct alternating horizontal ridges in lower half (y: 100 to 180)
         for (y in 100 until 180 step 12) {
             for (x in 40 until 160) {
                 for (offset in 0..4) {
@@ -52,10 +55,8 @@ class OnDeviceSafetyEngineTest {
     @Test
     fun `ground void discontinuity triggers drop-off detection`() {
         val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
-        // Upper and middle area is dark void / black pit
         bitmap.eraseColor(Color.BLACK)
 
-        // Immediate foot area at bottom is illuminated pavement
         for (y in 175 until 200) {
             for (x in 0 until 200) {
                 bitmap.setPixel(x, y, Color.WHITE)
@@ -69,9 +70,8 @@ class OnDeviceSafetyEngineTest {
     @Test
     fun `pothole cavity in pavement triggers pothole detection`() {
         val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
-        bitmap.eraseColor(Color.LTGRAY) // Light asphalt/concrete pavement
+        bitmap.eraseColor(Color.LTGRAY)
 
-        // Draw an enclosed dark pothole cavity in the forward walking corridor (e.g. y: 125-150, x: 75-125)
         for (y in 125 until 150) {
             for (x in 75 until 125) {
                 bitmap.setPixel(x, y, Color.BLACK)
@@ -89,5 +89,51 @@ class OnDeviceSafetyEngineTest {
 
         val hasPothole = engine.detectPotholeOrGroundCavity(bitmap)
         assertFalse("Uniform pavement must not trigger pothole", hasPothole)
+    }
+
+    @Test
+    fun `overhead clearance aim ignores ground pothole patterns`() {
+        val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.LTGRAY)
+        for (y in 125 until 150) {
+            for (x in 75 until 125) {
+                bitmap.setPixel(x, y, Color.BLACK)
+            }
+        }
+
+        val hasPotholeWhenAimedUp = engine.detectPotholeOrGroundCavity(bitmap, CameraAimZone.OVERHEAD_CLEARANCE)
+        assertFalse("Overhead aim must not misread dark ceiling features as ground potholes", hasPotholeWhenAimedUp)
+    }
+
+    @Test
+    fun `downward ground near aim expands pothole scan to upper center`() {
+        val bitmap = Bitmap.createBitmap(200, 200, Bitmap.Config.ARGB_8888)
+        bitmap.eraseColor(Color.LTGRAY)
+        // Pothole centered higher in frame (y: 55..90) when user aims downward
+        for (y in 55 until 90) {
+            for (x in 75 until 125) {
+                bitmap.setPixel(x, y, Color.BLACK)
+            }
+        }
+
+        val detectedInForward = engine.detectPotholeOrGroundCavity(bitmap, CameraAimZone.FORWARD_PATH)
+        val detectedInGroundNear = engine.detectPotholeOrGroundCavity(bitmap, CameraAimZone.GROUND_NEAR)
+        assertFalse("Upper-mid cavity is horizon/above ground in straight-ahead aim", detectedInForward)
+        assertTrue("Downward ground aim should detect cavity in expanded center zone", detectedInGroundNear)
+    }
+
+    @Test
+    fun `sensor analyzer classifies aim zones and motion shake accurately`() {
+        val context = ApplicationProvider.getApplicationContext<Context>()
+        val analyzer = DeviceSensorAnalyzer(context)
+
+        assertEquals(CameraAimZone.FORWARD_PATH, analyzer.classifyAimZone(0f))
+        assertEquals(CameraAimZone.FORWARD_PATH, analyzer.classifyAimZone(-8f))
+        assertEquals(CameraAimZone.GROUND_NEAR, analyzer.classifyAimZone(-25f))
+        assertEquals(CameraAimZone.OVERHEAD_CLEARANCE, analyzer.classifyAimZone(25f))
+
+        assertFalse("Steady hand must not trigger blur guard", analyzer.isExcessiveShake(0.3f, 0.4f))
+        assertTrue("Fast rotational jerk must trigger blur guard", analyzer.isExcessiveShake(2.2f, 0.5f))
+        assertTrue("Heavy linear jolt must trigger blur guard", analyzer.isExcessiveShake(0.2f, 5.5f))
     }
 }

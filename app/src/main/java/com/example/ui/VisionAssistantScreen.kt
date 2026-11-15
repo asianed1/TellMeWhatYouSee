@@ -158,7 +158,7 @@ fun VisionAssistantScreen(
                 onLongClick = { viewModel.toggleTorch() }
             )
             .semantics {
-                contentDescription = "Tactile screen surface. Tap to scan path. Double tap to repeat alert. Long press for flashlight."
+                contentDescription = "Tactile screen surface. Tap screen or press Volume Up or Down to scan. Double tap to repeat alert. Long press for flashlight."
             }
     ) {
         // Camera viewfinder layer
@@ -341,27 +341,24 @@ fun TopAccessibilityBar(
                 }
             }
 
-            // Tilt Angle Indicator Bar
+            // Aim Intent Indicator Bar (informational only; user dictates aim)
             Spacer(modifier = Modifier.height(6.dp))
             Row(
                 verticalAlignment = Alignment.CenterVertically,
                 modifier = Modifier.semantics {
-                    contentDescription = "Camera tilt status: $angleGuidance"
+                    contentDescription = "Active camera focus: $angleGuidance"
                 }
             ) {
                 Box(
                     modifier = Modifier
                         .size(8.dp)
-                        .background(
-                            if (isAngleOptimal) SafeGreen else CautionAmber,
-                            CircleShape
-                        )
+                        .background(SafeGreen, CircleShape)
                 )
                 Spacer(modifier = Modifier.width(6.dp))
                 Text(
                     text = angleGuidance,
                     fontSize = 11.sp,
-                    color = if (isAngleOptimal) SafeGreen else CautionAmber,
+                    color = SafeGreen,
                     fontWeight = FontWeight.Medium
                 )
             }
@@ -559,13 +556,13 @@ fun BottomAssistancePanel(
                         ) {
                             Column(modifier = Modifier.padding(8.dp)) {
                                 Text(
-                                    text = "${item.name} (${item.clockPosition})",
+                                    text = "${item.name} (${item.direction})",
                                     fontSize = 13.sp,
                                     fontWeight = FontWeight.Bold,
                                     color = SafetyYellow
                                 )
                                 Text(
-                                    text = "${item.approxSteps} steps (${item.approxDistanceMeters}m) • ${item.elevation}",
+                                    text = "${item.proximity} • ${item.elevation}",
                                     fontSize = 11.sp,
                                     color = HighContrastTextPrimary
                                 )
@@ -627,8 +624,8 @@ fun BottomAssistancePanel(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Concrete staircase going downwards",
-                                    "STOP! Stairs going down directly ahead, 2 steps away.",
+                                    "Possible concrete staircase going down",
+                                    "STOP! Possible stairs going down near straight ahead.",
                                     true,
                                     false,
                                     false,
@@ -649,8 +646,8 @@ fun BottomAssistancePanel(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Deep asphalt pothole cavity",
-                                    "STOP! Pothole directly ahead in walking path.",
+                                    "Possible pothole cavity in pavement",
+                                    "STOP! Possible pothole near straight ahead.",
                                     false,
                                     false,
                                     false,
@@ -671,8 +668,8 @@ fun BottomAssistancePanel(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.IMMINENT_DANGER,
-                                    "Curved subway platform edge",
-                                    "STOP! Drop-off detected directly ahead, 1 step away.",
+                                    "Possible platform edge or drop-off",
+                                    "STOP! Possible drop-off near straight ahead.",
                                     false,
                                     false,
                                     true,
@@ -701,8 +698,8 @@ fun BottomAssistancePanel(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.CAUTION,
-                                    "Flight of steps leading upward",
-                                    "Caution: Steps going up directly ahead, 2 steps away.",
+                                    "Possible steps leading upward",
+                                    "Caution: Possible steps going up near straight ahead.",
                                     false,
                                     true,
                                     false,
@@ -718,13 +715,13 @@ fun BottomAssistancePanel(
                             Text("Stairs Up", fontSize = 10.sp, color = Color.Black)
                         }
 
-                        // Scenario 5: Obstacle at 1 o'clock
+                        // Scenario 5: Obstacle slightly right
                         Button(
                             onClick = {
                                 onSimulate(
                                     HazardSeverity.CAUTION,
-                                    "Trash can at 1 o'clock",
-                                    "Caution: Trash can at 1 o'clock, 3 steps ahead.",
+                                    "Possible obstacle slightly right",
+                                    "Caution: Possible obstacle far slightly right.",
                                     false,
                                     false,
                                     false,

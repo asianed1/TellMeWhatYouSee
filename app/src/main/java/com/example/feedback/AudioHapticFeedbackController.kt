@@ -139,6 +139,32 @@ class AudioHapticFeedbackController(
     }
 
     /**
+     * Immediate shutter-complete earcon + micro-tick for manual snapshots so the user
+     * knows the frame is locked in and they no longer need to hold the camera still.
+     */
+    fun playShutterLockedCue() {
+        try {
+            cautionToneGenerator?.startTone(ToneGenerator.TONE_PROP_BEEP, 55)
+            vibratePattern(HapticPattern.SAFE_TICK)
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed playing shutter cue", e)
+        }
+    }
+
+    /**
+     * Gentle warning when excessive camera movement occurs during snapshot capture.
+     */
+    fun playMotionBlurWarning() {
+        try {
+            cautionToneGenerator?.startTone(ToneGenerator.TONE_PROP_NACK, 150)
+            vibratePattern(HapticPattern.DOUBLE_CAUTION_PULSE)
+            speakInformative("Camera moved. Hold steady and try again.")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed playing motion blur warning", e)
+        }
+    }
+
+    /**
      * Hardware vibration waveforms based on safety level.
      */
     fun vibratePattern(pattern: HapticPattern) {

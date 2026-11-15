@@ -29,7 +29,7 @@ private const val TAG = "VisionViewModel"
 data class AssistantUiState(
     val isAnalyzing: Boolean = false,
     val currentAssessment: HazardAssessment? = null,
-    val lastAlertText: String = "Ready. Tap screen to inspect path ahead.",
+    val lastAlertText: String = "Ready. Tap screen or press Volume Up/Down to scan.",
     val operatingMode: OperatingMode = OperatingMode.ON_DEMAND,
     val isTorchActive: Boolean = false,
     val isOnline: Boolean = true,
@@ -42,6 +42,12 @@ class VisionAssistantViewModel(
     application: Application
 ) : AndroidViewModel(application) {
 
+    private sealed class CaptureOutcome {
+        data class Success(val bitmap: Bitmap) : CaptureOutcome()
+        data object MotionBlurred : CaptureOutcome()
+        data object Unavailable : CaptureOutcome()
+    }
+
     private val feedbackController = AudioHapticFeedbackController(application)
     private val sensorAnalyzer = DeviceSensorAnalyzer(application)
     private val networkMonitor = NetworkMonitor(application)
@@ -52,6 +58,7 @@ class VisionAssistantViewModel(
     val uiState: StateFlow<AssistantUiState> = _uiState.asStateFlow()
 
     private var continuousScanJob: Job? = null
+    private var isCapturing: Boolean = false
     var frameProvider: (suspend () -> Bitmap?)? = null
     var torchController: ((Boolean) -> Unit)? = null
 
@@ -83,34 +90,39 @@ class VisionAssistantViewModel(
     }
 
     /**
-     * Captures a frame. At night or in low-light (< 35 lux), triggers a synchronized
-     * quick flash pulse (turns torch on for ~260ms for sensor 3A convergence, captures
-     * the illuminated frame, and immediately turns it off).
+     * Captures a frame with a lightweight sensor-based motion blur guard.
+     * At night or in low-light (< 35 lux), triggers a synchronized quick flash pulse
+     * (turns torch on for ~260ms for 3A convergence, captures, and turns it off).
      */
-    private suspend fun captureFrameWithFlashPulse(): Bitmap? {
-        val isLowLight = sensorAnalyzer.isLowLight()
+    private suspend fun captureFrameWithFlashPulse(forcePulse: Boolean = false): CaptureOutcome {
+        val provider = frameProvider ?: return CaptureOutcome.Unavailable
+        val isLowLight = forcePulse || sensorAnalyzer.isLowLight()
         val shouldPulse = isLowLight && !_uiState.value.isTorchActive
 
-        return if (shouldPulse) {
+        sensorAnalyzer.beginCaptureMotionWindow()
+        val capturedBitmap: Bitmap? = if (shouldPulse) {
             try {
-                // Fire quick light flash pulse
                 torchController?.invoke(true)
                 delay(260L) // Allow camera sensor 3A (Auto-Exposure/Auto-Focus) to settle under light
-                frameProvider?.invoke()
+                provider.invoke()
             } catch (e: Exception) {
                 Log.w(TAG, "Flash pulse capture encountered error", e)
-                frameProvider?.invoke()
+                provider.invoke()
             } finally {
-                // Extinguish light immediately
                 torchController?.invoke(false)
             }
         } else {
-            frameProvider?.invoke()
+            provider.invoke()
         }
+
+        val wasShaken = sensorAnalyzer.endCaptureMotionWindowAndCheckShake()
+        if (capturedBitmap == null) return CaptureOutcome.Unavailable
+        if (wasShaken) return CaptureOutcome.MotionBlurred
+        return CaptureOutcome.Success(capturedBitmap)
     }
 
     /**
-     * Executes analysis of the provided bitmap.
+     * Executes analysis of the provided bitmap using the user's current camera aim intent.
      */
     fun analyzeBitmap(bitmap: Bitmap) {
         if (_uiState.value.isAnalyzing) return
@@ -124,26 +136,37 @@ class VisionAssistantViewModel(
             // If an un-pulsed first capture was pitch black (< 18 lux), quickly re-capture with flash pulse
             var targetBitmap = bitmap
             if (lux < 18f && !_uiState.value.isTorchActive) {
-                val pulsed = captureFrameWithFlashPulse()
-                if (pulsed != null) {
-                    targetBitmap = pulsed
-                    sensorAnalyzer.analyzeFrameLuminance(targetBitmap)
+                when (val retry = captureFrameWithFlashPulse(forcePulse = true)) {
+                    is CaptureOutcome.Success -> {
+                        targetBitmap = retry.bitmap
+                        sensorAnalyzer.analyzeFrameLuminance(targetBitmap)
+                    }
+                    is CaptureOutcome.MotionBlurred -> {
+                        _uiState.value = _uiState.value.copy(
+                            isAnalyzing = false,
+                            lastAlertText = "Camera moved. Hold steady and try again."
+                        )
+                        feedbackController.playMotionBlurWarning()
+                        return@launch
+                    }
+                    is CaptureOutcome.Unavailable -> Unit
                 }
             }
 
             try {
                 val isOnline = _uiState.value.isOnline
+                val aimZone = _uiState.value.telemetry.aimZone
                 val assessment = if (isOnline) {
                     try {
-                        geminiService.analyzeFrame(targetBitmap)
+                        geminiService.analyzeFrame(targetBitmap, aimZone)
                     } catch (e: CancellationException) {
                         throw e
                     } catch (e: Exception) {
                         Log.w(TAG, "Cloud AI failed, falling back to local safety engine", e)
-                        onDeviceSafetyEngine.analyzeFrame(targetBitmap)
+                        onDeviceSafetyEngine.analyzeFrame(targetBitmap, aimZone)
                     }
                 } else {
-                    onDeviceSafetyEngine.analyzeFrame(targetBitmap)
+                    onDeviceSafetyEngine.analyzeFrame(targetBitmap, aimZone)
                 }
 
                 // Multi-sensory feedback dispatch
@@ -173,21 +196,37 @@ class VisionAssistantViewModel(
     }
 
     /**
-     * Triggered by user tap anywhere on the tactile surface.
+     * Triggered by user tap anywhere on the screen OR pressing Volume Up / Volume Down.
      */
     fun onUserTriggerScan() {
+        if (_uiState.value.isAnalyzing || isCapturing) return
         viewModelScope.launch {
-            val bmp = captureFrameWithFlashPulse()
-            if (bmp != null) {
-                analyzeBitmap(bmp)
-            } else {
-                feedbackController.speakInformative("Camera initializing, please try in a moment.")
+            isCapturing = true
+            try {
+                when (val outcome = captureFrameWithFlashPulse()) {
+                    is CaptureOutcome.Success -> {
+                        // Immediately inform user snapshot is locked in so they can relax/move normally
+                        feedbackController.playShutterLockedCue()
+                        analyzeBitmap(outcome.bitmap)
+                    }
+                    is CaptureOutcome.MotionBlurred -> {
+                        _uiState.value = _uiState.value.copy(
+                            lastAlertText = "Camera moved. Hold steady and try again."
+                        )
+                        feedbackController.playMotionBlurWarning()
+                    }
+                    is CaptureOutcome.Unavailable -> {
+                        feedbackController.speakInformative("Camera initializing, please try in a moment.")
+                    }
+                }
+            } finally {
+                isCapturing = false
             }
         }
     }
 
     /**
-     * Toggles between Continuous Scanning (every 3 seconds) and On-Demand Tap mode.
+     * Toggles between Continuous Scanning (every 3 seconds) and On-Demand mode.
      */
     fun toggleOperatingMode() {
         val newMode = if (_uiState.value.operatingMode == OperatingMode.ON_DEMAND) {
@@ -203,7 +242,7 @@ class VisionAssistantViewModel(
             startContinuousLoop()
         } else {
             continuousScanJob?.cancel()
-            feedbackController.speakInformative("On demand mode. Tap screen anytime to scan.")
+            feedbackController.speakInformative("On demand mode. Tap screen or press a volume button anytime to scan.")
         }
     }
 
@@ -211,10 +250,10 @@ class VisionAssistantViewModel(
         continuousScanJob?.cancel()
         continuousScanJob = viewModelScope.launch {
             while (_uiState.value.operatingMode == OperatingMode.CONTINUOUS_AUTO) {
-                if (!_uiState.value.isAnalyzing) {
-                    val bmp = captureFrameWithFlashPulse()
-                    if (bmp != null) {
-                        analyzeBitmap(bmp)
+                if (!_uiState.value.isAnalyzing && !isCapturing) {
+                    val outcome = captureFrameWithFlashPulse()
+                    if (outcome is CaptureOutcome.Success) {
+                        analyzeBitmap(outcome.bitmap)
                     }
                 }
                 delay(3000L)

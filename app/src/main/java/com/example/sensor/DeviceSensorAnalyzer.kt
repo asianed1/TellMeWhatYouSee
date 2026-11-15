@@ -6,6 +6,7 @@ import android.hardware.Sensor
 import android.hardware.SensorEvent
 import android.hardware.SensorEventListener
 import android.hardware.SensorManager
+import com.example.model.CameraAimZone
 import com.example.model.SensorTelemetry
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -14,8 +15,8 @@ import kotlin.math.atan2
 import kotlin.math.sqrt
 
 /**
- * Tracks device tilt angle and ambient camera frame brightness.
- * Ensures the camera is pointing at the user's forward walking path.
+ * Tracks user camera aim intent (downward ground, straight forward, upward overhead),
+ * ambient light levels, and lightweight motion shake during the snapshot shutter window.
  */
 class DeviceSensorAnalyzer(context: Context) : SensorEventListener {
 
@@ -23,12 +24,24 @@ class DeviceSensorAnalyzer(context: Context) : SensorEventListener {
     private val gravitySensor: Sensor? = sensorManager?.getDefaultSensor(Sensor.TYPE_GRAVITY)
         ?: sensorManager?.getDefaultSensor(Sensor.TYPE_ACCELEROMETER)
     private val lightSensor: Sensor? = sensorManager?.getDefaultSensor(Sensor.TYPE_LIGHT)
+    private val gyroSensor: Sensor? = sensorManager?.getDefaultSensor(Sensor.TYPE_GYROSCOPE)
+    private val linearAccelSensor: Sensor? = if (gyroSensor == null) {
+        sensorManager?.getDefaultSensor(Sensor.TYPE_LINEAR_ACCELERATION)
+    } else null
 
     private val _telemetry = MutableStateFlow(SensorTelemetry())
     val telemetry: StateFlow<SensorTelemetry> = _telemetry.asStateFlow()
 
     private var lastMeasuredLux: Float = 100f
     private var hasHardwareLightSensor: Boolean = false
+
+    // Lightweight capture-window motion guard (zero heap allocations)
+    @Volatile
+    private var isCaptureMotionWindowActive: Boolean = false
+    @Volatile
+    private var peakAngularVelocityRadPerSec: Float = 0f
+    @Volatile
+    private var peakLinearAccelMps2: Float = 0f
 
     fun startListening() {
         gravitySensor?.let { sensor ->
@@ -37,6 +50,12 @@ class DeviceSensorAnalyzer(context: Context) : SensorEventListener {
         lightSensor?.let { sensor ->
             hasHardwareLightSensor = true
             sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_UI)
+        }
+        gyroSensor?.let { sensor ->
+            sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
+        }
+        linearAccelSensor?.let { sensor ->
+            sensorManager?.registerListener(this, sensor, SensorManager.SENSOR_DELAY_GAME)
         }
     }
 
@@ -49,35 +68,95 @@ class DeviceSensorAnalyzer(context: Context) : SensorEventListener {
         return lastMeasuredLux < 35f
     }
 
+    /**
+     * Marks the start of a snapshot capture window to monitor camera shake.
+     */
+    fun beginCaptureMotionWindow() {
+        peakAngularVelocityRadPerSec = 0f
+        peakLinearAccelMps2 = 0f
+        isCaptureMotionWindowActive = true
+    }
+
+    /**
+     * Ends the capture window and returns true if excessive shake/motion likely blurred the frame.
+     */
+    fun endCaptureMotionWindowAndCheckShake(): Boolean {
+        isCaptureMotionWindowActive = false
+        return isExcessiveShake(peakAngularVelocityRadPerSec, peakLinearAccelMps2)
+    }
+
+    fun isExcessiveShake(angularRadPerSec: Float, linearAccelMps2: Float): Boolean {
+        // > ~1.75 rad/s (~100 deg/s rotation) or > 4.5 m/s^2 linear jolt during shutter causes blur
+        return angularRadPerSec > 1.75f || linearAccelMps2 > 4.5f
+    }
+
+    /**
+     * Classifies signed pitch relative to upright straight-ahead (0 deg = Z-axis perpendicular to standing user).
+     * Negative = tilted downward toward ground; Positive = tilted upward toward overhead.
+     */
+    fun classifyAimZone(pitchDegrees: Float): CameraAimZone {
+        return when {
+            pitchDegrees < -14.0f -> CameraAimZone.GROUND_NEAR
+            pitchDegrees > 14.0f -> CameraAimZone.OVERHEAD_CLEARANCE
+            else -> CameraAimZone.FORWARD_PATH
+        }
+    }
+
     override fun onSensorChanged(event: SensorEvent) {
-        if (event.sensor.type == Sensor.TYPE_LIGHT) {
-            val ambientLux = event.values[0]
-            lastMeasuredLux = ambientLux
-            _telemetry.value = _telemetry.value.copy(ambientLux = ambientLux)
-            return
+        when (event.sensor.type) {
+            Sensor.TYPE_LIGHT -> {
+                val ambientLux = event.values[0]
+                lastMeasuredLux = ambientLux
+                _telemetry.value = _telemetry.value.copy(ambientLux = ambientLux)
+                return
+            }
+            Sensor.TYPE_GYROSCOPE -> {
+                if (!isCaptureMotionWindowActive) return
+                val wx = event.values[0]
+                val wy = event.values[1]
+                val wz = event.values[2]
+                val mag = sqrt((wx * wx + wy * wy + wz * wz).toDouble()).toFloat()
+                if (mag > peakAngularVelocityRadPerSec) {
+                    peakAngularVelocityRadPerSec = mag
+                }
+                return
+            }
+            Sensor.TYPE_LINEAR_ACCELERATION -> {
+                if (!isCaptureMotionWindowActive) return
+                val ax = event.values[0]
+                val ay = event.values[1]
+                val az = event.values[2]
+                val mag = sqrt((ax * ax + ay * ay + az * az).toDouble()).toFloat()
+                if (mag > peakLinearAccelMps2) {
+                    peakLinearAccelMps2 = mag
+                }
+                return
+            }
         }
 
         val x = event.values[0]
         val y = event.values[1]
         val z = event.values[2]
 
-        // Calculate pitch angle in degrees relative to vertical/horizontal
-        val pitchRad = atan2(y.toDouble(), sqrt((x * x + z * z).toDouble()))
+        // 0 deg = held upright straight ahead (Z-axis perpendicular to standing user).
+        // Tilting top forward to look down at ground yields positive +Z -> negative pitch angle.
+        // Tilting top back to look up at ceiling yields negative -Z -> positive pitch angle.
+        val pitchRad = -atan2(z.toDouble(), sqrt((x * x + y * y).toDouble()))
         val pitchDeg = Math.toDegrees(pitchRad).toFloat()
 
-        // Optimal walking stance: 30° to 65° forward downward tilt
-        val isOptimal = pitchDeg in 25.0f..70.0f
-        val guidance = when {
-            pitchDeg < 20.0f -> "Tilt down slightly to scan walking path"
-            pitchDeg > 75.0f -> "Tilt up slightly, currently pointing at feet"
-            else -> "Angle optimal"
+        val aimZone = classifyAimZone(pitchDeg)
+        val aimLabel = when (aimZone) {
+            CameraAimZone.GROUND_NEAR -> "Ground scan (aimed down)"
+            CameraAimZone.OVERHEAD_CLEARANCE -> "Overhead scan (aimed up)"
+            CameraAimZone.FORWARD_PATH -> "Forward path scan"
         }
 
         val current = _telemetry.value
         _telemetry.value = current.copy(
             pitchDegrees = pitchDeg,
-            isWalkingAngleOptimal = isOptimal,
-            angleGuidanceText = guidance
+            aimZone = aimZone,
+            isWalkingAngleOptimal = true,
+            angleGuidanceText = aimLabel
         )
     }
 
