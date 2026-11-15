@@ -58,28 +58,21 @@ class MiDaSDepthEstimator(
         if (initializationFailed) return false
 
         return try {
-            val (model, accelName) = try {
-                val gpuModel = CompiledModel.create(
-                    context.assets,
-                    MODEL_ASSET_NAME,
-                    CompiledModel.Options(Accelerator.GPU)
-                )
-                gpuModel to "GPU"
-            } catch (gpuError: Throwable) {
-                Log.w(TAG, "LiteRT GPU delegate unavailable, falling back to CPU", gpuError)
-                val cpuModel = CompiledModel.create(
-                    context.assets,
-                    MODEL_ASSET_NAME,
-                    CompiledModel.Options(Accelerator.CPU)
-                )
-                cpuModel to "CPU"
+            val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
+            val options = CompiledModel.Options(Accelerator.CPU).apply {
+                cpuOptions = CompiledModel.CpuOptions(numThreads = threads)
             }
+            val model = CompiledModel.create(
+                context.assets,
+                MODEL_ASSET_NAME,
+                options
+            )
 
             compiledModel = model
-            activeAcceleratorName = accelName
+            activeAcceleratorName = "CPU"
             inputBuffers = model.createInputBuffers()
             outputBuffers = model.createOutputBuffers()
-            Log.i(TAG, "MiDaS LiteRT initialized on $accelName")
+            Log.i(TAG, "MiDaS LiteRT initialized on CPU ($threads threads)")
             true
         } catch (t: Throwable) {
             Log.e(TAG, "Failed to initialize LiteRT MiDaS model", t)
